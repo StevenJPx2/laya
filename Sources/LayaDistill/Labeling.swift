@@ -1,50 +1,26 @@
 import Foundation
-
-public struct LabelingPlan: Codable, Sendable {
-    public let teacher: String
-    public let pending: Int
-    public let selected: Int
-    public let alreadyLabeled: Int
-    public let priorRequests: Int
-    public let priorSpendUsd: Double
-    public let estimatedInputTokens: Int
-    public let maxOutputTokens: Int
-    public let worstCaseUsd: Double
-    public let budgetUsd: Double
-    public let maxRequests: Int
-    public let truncatedByBudget: Bool
-
-    enum CodingKeys: String, CodingKey {
-        case teacher, pending, selected
-        case alreadyLabeled = "already_labeled", priorRequests = "prior_requests", priorSpendUsd = "prior_spend_usd"
-        case estimatedInputTokens = "estimated_input_tokens", maxOutputTokens = "max_output_tokens", worstCaseUsd = "worst_case_usd"
-        case budgetUsd = "budget_usd", maxRequests = "max_requests", truncatedByBudget = "truncated_by_budget"
-    }
-}
+import LayaCore
 
 public struct LabelingSummary: Codable, Sendable {
-    public var plan: LabelingPlan
-    public var dryRun: Bool
-    public var requests = 0
-    public var ok = 0
-    public var invalid = 0
-    public var refused = 0
+    public var teacher: String
+    public var questionType: String
+    public var pending = 0
+    public var selected = 0
+    public var accepted = 0
+    public var uncertainToAbstain = 0
+    public var uncertainDropped = 0
     public var errors = 0
-    public var inputTokens = 0
-    public var outputTokens = 0
-    public var spentUsd = 0.0
     public var stopReason: String?
 
     enum CodingKeys: String, CodingKey {
-        case plan, requests, ok, invalid, refused, errors
-        case dryRun = "dry_run", inputTokens = "input_tokens", outputTokens = "output_tokens", spentUsd = "spent_usd", stopReason = "stop_reason"
+        case teacher, pending, selected, accepted, errors
+        case questionType = "question_type", uncertainToAbstain = "uncertain_to_abstain", uncertainDropped = "uncertain_dropped", stopReason = "stop_reason"
     }
 }
 
-/// Bounded teacher labeling. Nothing is sent unless `approve` is true, and the
-/// spec's `budget` is enforced cumulatively across runs using the label file.
+/// Asks Laya the task question for each pending row and records the gated result.
 public struct Labeler: Sendable {
-    public static let maxConsecutiveFailures = 5
+    public static let maxConsecutiveErrors = 5
 
     let spec: TaskSpec
     let examples: [DatasetExample]
@@ -56,116 +32,68 @@ public struct Labeler: Sendable {
         self.existing = existing
     }
 
-    public func plan(limit: Int? = nil) -> (plan: LabelingPlan, batch: [DatasetExample]) {
-        let pending = examples.filter { example in
+    /// Rows without a usable record for the current content and question.
+    public func pending() -> [DatasetExample] {
+        let question = LayaQuestion.sha256(spec)
+
+        return examples.filter { example in
             guard let record = existing[example.id] else { return true }
 
-            return record.status != .ok || record.contentHash != example.contentHash
+            return record.status == .error || record.contentHash != example.contentHash || record.questionSha256 != question
         }
-        let prior = existing.values.filter { $0.teacher == spec.teacher.identity }
-        let priorSpend = prior.reduce(0) { $0 + $1.costUsd }
-        let networked = spec.teacher.provider.isNetworked
-        let requestRoom = networked ? max(0, spec.budget.maxRequests - prior.count) : pending.count
-        var batch = Array(pending.prefix(min(limit ?? pending.count, requestRoom)))
-
-        var estimated = 0
-        var worst = 0.0
-        var fitted: [DatasetExample] = []
-
-        for example in batch {
-            let tokens = TeacherPrompt.estimatedInputTokens(spec, example.input)
-            let cost = networked ? worstCase(tokens) : 0
-
-            if networked, priorSpend + worst + cost > spec.budget.maxUsd { break }
-
-            estimated += tokens
-            worst += cost
-            fitted.append(example)
-        }
-
-        let truncated = fitted.count < batch.count
-        batch = fitted
-
-        let plan = LabelingPlan(
-            teacher: spec.teacher.identity, pending: pending.count, selected: batch.count, alreadyLabeled: examples.count - pending.count,
-            priorRequests: prior.count, priorSpendUsd: priorSpend, estimatedInputTokens: estimated, maxOutputTokens: spec.teacher.maxOutputTokens,
-            worstCaseUsd: worst, budgetUsd: spec.budget.maxUsd, maxRequests: spec.budget.maxRequests, truncatedByBudget: truncated
-        )
-
-        return (plan, batch)
     }
 
-    func worstCase(_ inputTokens: Int) -> Double {
-        spec.teacher.pricing?.cost(input: inputTokens, output: spec.teacher.maxOutputTokens) ?? 0
-    }
+    public func run(teacher: LayaTeacher, limit: Int? = nil, sink: (LabelRecord) throws -> Void, log: (String) -> Void) async throws -> LabelingSummary {
+        let pending = pending()
+        let batch = Array(pending.prefix(limit ?? pending.count))
+        let question = LayaQuestion.make(spec)
+        var summary = LabelingSummary(teacher: teacher.identity, questionType: spec.teacher.questionType.rawValue, pending: pending.count, selected: batch.count)
+        var failures = 0
 
-    public func run(limit: Int? = nil, approve: Bool, client: TeacherClient?,
-                    sink: (LabelRecord) throws -> Void, log: (String) -> Void) async throws -> LabelingSummary {
-        let (plan, batch) = plan(limit: limit)
-        var summary = LabelingSummary(plan: plan, dryRun: false)
+        for (index, example) in batch.enumerated() {
+            let record = await label(example, teacher: teacher, question: question)
+            try sink(record)
+            count(record, into: &summary)
+            log("[label] \(index + 1)/\(batch.count) \(String(example.contentHash.prefix(10))) \(record.status.rawValue) \(record.label ?? "-")")
 
-        if spec.teacher.provider == .dataset {
-            for example in batch { try record(goldRecord(example), into: &summary, sink: sink) }
-            return summary
+            failures = record.status == .error ? failures + 1 : 0
+            if failures >= Self.maxConsecutiveErrors {
+                summary.stopReason = "stopped after \(failures) consecutive teacher errors (last: \(record.reason ?? "unknown"))"
+                break
+            }
         }
-
-        guard approve else {
-            summary.dryRun = true
-            summary.stopReason = "dry run: pass --approve to send \(plan.selected) request(s), worst case $\(String(format: "%.4f", plan.worstCaseUsd))"
-            return summary
-        }
-        guard let client else { throw DistillError.teacher("no teacher client configured") }
-
-        try await label(batch, client: client, summary: &summary, sink: sink, log: log)
 
         return summary
     }
 
-    private func label(_ batch: [DatasetExample], client: TeacherClient, summary: inout LabelingSummary,
-                       sink: (LabelRecord) throws -> Void, log: (String) -> Void) async throws {
-        var failures = 0
+    private func label(_ example: DatasetExample, teacher: LayaTeacher, question: Question) async -> LabelRecord {
+        let questionHash = LayaQuestion.sha256(spec)
 
-        for (index, example) in batch.enumerated() {
-            let worst = worstCase(TeacherPrompt.estimatedInputTokens(spec, example.input))
+        do {
+            let answer = try await teacher.answer(state: example.input.jsonValue, question: question)
+            let probabilities = try LayaQuestion.probabilities(answer, spec: spec)
+            let decision = try TeacherPolicy.decide(probabilities, spec: spec)
 
-            guard summary.plan.priorSpendUsd + summary.spentUsd + worst <= spec.budget.maxUsd else {
-                summary.stopReason = "budget: next request could exceed max_usd"
-                return
-            }
-
-            let result = try await client.label(example.input)
-            let billed = result.inputTokens + result.outputTokens == 0 ? worst : spec.teacher.pricing!.cost(input: result.inputTokens, output: result.outputTokens)
-
-            summary.requests += 1
-            try record(LabelRecord(id: example.id, contentHash: example.contentHash, label: result.label, status: result.status, reason: result.reason,
-                                   teacher: spec.teacher.identity, inputTokens: result.inputTokens, outputTokens: result.outputTokens, costUsd: billed),
-                       into: &summary, sink: sink)
-            log("[label] \(index + 1)/\(batch.count) \(String(example.contentHash.prefix(10))) \(result.status.rawValue)")
-
-            failures = result.status == .ok ? 0 : failures + 1
-            if failures >= Self.maxConsecutiveFailures {
-                summary.stopReason = "stopped after \(failures) consecutive failures (last: \(result.reason ?? "unknown"))"
-                return
-            }
+            return LabelRecord(
+                id: example.id, contentHash: example.contentHash, questionSha256: questionHash, teacher: teacher.identity, status: decision.status,
+                layaLabel: decision.layaLabel, label: decision.label, probabilities: Dictionary(uniqueKeysWithValues: zip(spec.labelNames, probabilities)),
+                top: decision.top, margin: decision.margin, layaConfidence: answer.confidence, actProbability: answer.action.act_probability,
+                reason: decision.status == .uncertain ? "below min_confidence \(spec.teacher.minConfidence) or min_margin \(spec.teacher.minMargin)" : nil
+            )
+        } catch {
+            return LabelRecord(
+                id: example.id, contentHash: example.contentHash, questionSha256: questionHash, teacher: teacher.identity, status: .error,
+                layaLabel: nil, label: nil, probabilities: nil, top: nil, margin: nil, layaConfidence: nil, actProbability: nil,
+                reason: String(error.localizedDescription.prefix(200))
+            )
         }
     }
 
-    private func goldRecord(_ example: DatasetExample) -> LabelRecord {
-        LabelRecord(id: example.id, contentHash: example.contentHash, label: example.gold, status: example.gold == nil ? .invalid : .ok,
-                    reason: example.gold == nil ? "row has no gold label" : nil, teacher: spec.teacher.identity, inputTokens: 0, outputTokens: 0, costUsd: 0)
-    }
-
-    private func record(_ record: LabelRecord, into summary: inout LabelingSummary, sink: (LabelRecord) throws -> Void) throws {
-        try sink(record)
-
-        summary.inputTokens += record.inputTokens
-        summary.outputTokens += record.outputTokens
-        summary.spentUsd += record.costUsd
-
+    private func count(_ record: LabelRecord, into summary: inout LabelingSummary) {
         switch record.status {
-        case .ok: summary.ok += 1
-        case .invalid: summary.invalid += 1
-        case .refused: summary.refused += 1
+        case .accepted: summary.accepted += 1
+        case .uncertain where record.label != nil: summary.uncertainToAbstain += 1
+        case .uncertain: summary.uncertainDropped += 1
         case .error: summary.errors += 1
         }
     }

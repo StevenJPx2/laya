@@ -98,114 +98,47 @@ public struct TaskInput: Sendable {
     }
 }
 
-public enum TeacherProvider: String, Codable, Sendable {
-    case anthropic
-    case openaiCompatible = "openai-compatible"
-    /// Uses the dataset's `gold` labels as the teacher. No network, no cost.
-    case dataset
+/// Which typed Laya question the task is asked as.
+/// - `choice`: one option per label (`name: description`).
+/// - `noul`: exactly two labels; the first is "false", the second "true".
+/// - `score`: labels are ordered rubric levels, lowest first.
+public enum QuestionType: String, Codable, Sendable { case choice, noul, score }
 
-    var isNetworked: Bool { self != .dataset }
-}
+/// What happens to a Laya answer that fails the confidence gate.
+/// - `abstain`: train on the task's abstain label (for example `ask`) instead.
+/// - `drop`: exclude the row from training.
+public enum UncertainPolicy: String, Codable, Sendable { case abstain, drop }
 
-public struct Pricing: Codable, Sendable {
-    public let inputUsdPerMtok: Double
-    public let outputUsdPerMtok: Double
-
-    enum CodingKeys: String, CodingKey, CaseIterable { case inputUsdPerMtok = "input_usd_per_mtok", outputUsdPerMtok = "output_usd_per_mtok" }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.strictContainer(keyedBy: CodingKeys.self, context: "teacher.pricing")
-        inputUsdPerMtok = try c.decode(Double.self, forKey: .inputUsdPerMtok)
-        outputUsdPerMtok = try c.decode(Double.self, forKey: .outputUsdPerMtok)
-    }
-
-    func cost(input: Int, output: Int) -> Double {
-        (Double(input) * inputUsdPerMtok + Double(output) * outputUsdPerMtok) / 1_000_000
-    }
-}
-
+/// Laya is the teacher. An answer becomes a hard training label only when its
+/// top probability is at least `min_confidence` and it leads the runner-up by
+/// at least `min_margin`.
 public struct TeacherSpec: Codable, Sendable {
-    public let provider: TeacherProvider
-    public let model: String
-    public let baseURL: String?
-    public let apiKeyEnv: String?
-    public let maxOutputTokens: Int
-    public let timeoutSeconds: Int
-    public let maxRetries: Int
-    public let maxTokensField: String
-    public let pricing: Pricing?
+    public let questionType: QuestionType
+    public let minConfidence: Double
+    public let minMargin: Double
+    public let uncertain: UncertainPolicy
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case provider, model, baseURL = "base_url", apiKeyEnv = "api_key_env", maxOutputTokens = "max_output_tokens"
-        case timeoutSeconds = "timeout_seconds", maxRetries = "max_retries", maxTokensField = "max_tokens_field", pricing
+        case questionType = "question_type", minConfidence = "min_confidence", minMargin = "min_margin", uncertain
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.strictContainer(keyedBy: CodingKeys.self, context: "teacher")
-        provider = try c.decode(TeacherProvider.self, forKey: .provider)
-        model = try c.decode(String.self, forKey: .model)
-        baseURL = try c.decodeIfPresent(String.self, forKey: .baseURL)
-        apiKeyEnv = try c.decodeIfPresent(String.self, forKey: .apiKeyEnv)
-        maxOutputTokens = try c.decodeIfPresent(Int.self, forKey: .maxOutputTokens) ?? 64
-        timeoutSeconds = try c.decodeIfPresent(Int.self, forKey: .timeoutSeconds) ?? 60
-        maxRetries = try c.decodeIfPresent(Int.self, forKey: .maxRetries) ?? 2
-        maxTokensField = try c.decodeIfPresent(String.self, forKey: .maxTokensField) ?? "max_completion_tokens"
-        pricing = try c.decodeIfPresent(Pricing.self, forKey: .pricing)
+        questionType = try c.decode(QuestionType.self, forKey: .questionType)
+        minConfidence = try c.decode(Double.self, forKey: .minConfidence)
+        minMargin = try c.decodeIfPresent(Double.self, forKey: .minMargin) ?? 0
+        uncertain = try c.decode(UncertainPolicy.self, forKey: .uncertain)
     }
 
-    public var identity: String { "\(provider.rawValue)/\(model)" }
-
-    func validate() throws {
-        guard !model.isEmpty, model.count <= 128 else { throw DistillError.invalidSpec("teacher.model must be set explicitly (1-128 characters)") }
-        guard provider.isNetworked else { return }
-
-        guard let apiKeyEnv, matches(apiKeyEnv, "^[A-Z_][A-Z0-9_]{0,63}$") else {
-            throw DistillError.invalidSpec("teacher.api_key_env must name an environment variable, e.g. ANTHROPIC_API_KEY; keys are never stored in the spec")
+    func validate(labels: Int, hasAbstain: Bool) throws {
+        guard minConfidence >= 0, minConfidence < 1, minMargin >= 0, minMargin < 1 else {
+            throw DistillError.invalidSpec("teacher.min_confidence and teacher.min_margin must be in [0, 1)")
         }
-        guard let pricing, pricing.inputUsdPerMtok >= 0, pricing.outputUsdPerMtok >= 0 else {
-            throw DistillError.invalidSpec("teacher.pricing is required for networked teachers so spend can be bounded")
+        if questionType == .noul, labels != 2 {
+            throw DistillError.invalidSpec("teacher.question_type noul needs exactly 2 labels (false first, true second)")
         }
-        guard (1...1024).contains(maxOutputTokens), (1...300).contains(timeoutSeconds), (0...5).contains(maxRetries) else {
-            throw DistillError.invalidSpec("teacher limits: max_output_tokens 1-1024, timeout_seconds 1-300, max_retries 0-5")
-        }
-        guard ["max_completion_tokens", "max_tokens"].contains(maxTokensField) else {
-            throw DistillError.invalidSpec("teacher.max_tokens_field must be max_completion_tokens or max_tokens")
-        }
-        if let baseURL {
-            guard let url = URL(string: baseURL), let scheme = url.scheme, ["https", "http"].contains(scheme) else {
-                throw DistillError.invalidSpec("teacher.base_url must be an http(s) URL")
-            }
-            guard scheme == "https" || ["localhost", "127.0.0.1", "::1"].contains(url.host ?? "") else {
-                throw DistillError.invalidSpec("teacher.base_url must use https unless it is a loopback address")
-            }
-        }
-        if provider == .openaiCompatible, baseURL == nil { throw DistillError.invalidSpec("teacher.base_url is required for openai-compatible") }
-    }
-}
-
-public struct BudgetSpec: Codable, Sendable {
-    public let maxRequests: Int
-    public let maxUsd: Double
-
-    enum CodingKeys: String, CodingKey, CaseIterable { case maxRequests = "max_requests", maxUsd = "max_usd" }
-
-    init() {
-        maxRequests = 0
-        maxUsd = 0
-    }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.strictContainer(keyedBy: CodingKeys.self, context: "budget")
-        maxRequests = try c.decode(Int.self, forKey: .maxRequests)
-        maxUsd = try c.decode(Double.self, forKey: .maxUsd)
-    }
-
-    func validate(networked: Bool) throws {
-        guard (0...100_000).contains(maxRequests), maxUsd >= 0, maxUsd <= 10_000 else {
-            throw DistillError.invalidSpec("budget: max_requests 0-100000, max_usd 0-10000")
-        }
-        if networked, maxRequests == 0 || maxUsd == 0 {
-            throw DistillError.invalidSpec("budget.max_requests and budget.max_usd must be positive for networked teachers")
+        if uncertain == .abstain, !hasAbstain {
+            throw DistillError.invalidSpec("teacher.uncertain abstain requires an abstain label")
         }
     }
 }
@@ -246,17 +179,11 @@ public struct DatasetSpec: Codable, Sendable {
     }
 }
 
-public enum FeatureKind: String, Codable, Sendable {
-    /// Frozen Laya encoder: pooled decision vector + per-label zero-shot logits.
-    case laya
-    /// Hashed word uni/bigrams. Model-free; useful for tiny tasks and tests.
-    case hashed
-}
-
 public enum ClassWeighting: String, Codable, Sendable { case balanced, none }
 
+/// The student: a softmax head over hashed word n-grams. It needs no Laya
+/// model at inference time.
 public struct StudentSpec: Codable, Sendable {
-    public let features: FeatureKind
     public let hashDimensions: Int
     public let epochs: Int
     public let learningRate: Double
@@ -267,11 +194,10 @@ public struct StudentSpec: Codable, Sendable {
     public let classWeighting: ClassWeighting
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case features, hashDimensions = "hash_dimensions", epochs, learningRate = "learning_rate", l2, l2Grid = "l2_grid", classWeighting = "class_weighting"
+        case hashDimensions = "hash_dimensions", epochs, learningRate = "learning_rate", l2, l2Grid = "l2_grid", classWeighting = "class_weighting"
     }
 
     init() {
-        features = .laya
         hashDimensions = 4096
         epochs = 300
         learningRate = 0.05
@@ -283,7 +209,6 @@ public struct StudentSpec: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.strictContainer(keyedBy: CodingKeys.self, context: "student")
         let defaults = StudentSpec()
-        features = try c.decodeIfPresent(FeatureKind.self, forKey: .features) ?? defaults.features
         hashDimensions = try c.decodeIfPresent(Int.self, forKey: .hashDimensions) ?? defaults.hashDimensions
         epochs = try c.decodeIfPresent(Int.self, forKey: .epochs) ?? defaults.epochs
         learningRate = try c.decodeIfPresent(Double.self, forKey: .learningRate) ?? defaults.learningRate

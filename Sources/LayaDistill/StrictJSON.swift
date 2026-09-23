@@ -4,7 +4,6 @@ import Foundation
 public enum DistillError: Error, LocalizedError, Sendable, Equatable {
     case invalidSpec(String)
     case invalidData(String)
-    case budget(String)
     case teacher(String)
     case training(String)
     case artifact(String)
@@ -13,7 +12,6 @@ public enum DistillError: Error, LocalizedError, Sendable, Equatable {
         switch self {
         case .invalidSpec(let message): return "invalid task spec: \(message)"
         case .invalidData(let message): return "invalid data: \(message)"
-        case .budget(let message): return "budget: \(message)"
         case .teacher(let message): return "teacher: \(message)"
         case .training(let message): return "training: \(message)"
         case .artifact(let message): return "artifact: \(message)"

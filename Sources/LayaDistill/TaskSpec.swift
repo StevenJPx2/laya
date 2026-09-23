@@ -1,13 +1,12 @@
 import Foundation
 import LayaCore
 
-/// A versioned classification task: input schema, labels, abstain policy,
-/// teacher, budget, dataset bounds, and student configuration.
+/// A versioned classification task: input schema, labels, abstain policy, the
+/// Laya teacher question and its confidence gate, dataset bounds, and student.
 public struct TaskSpec: Codable, Sendable {
-    public static let currentVersion = 1
+    public static let currentVersion = 2
     public static let maxLabels = 32
     public static let maxFields = 32
-    public static let maxExamples = 20
 
     public let specVersion: Int
     public let name: String
@@ -17,14 +16,12 @@ public struct TaskSpec: Codable, Sendable {
     public let input: InputSchema
     public let labels: [LabelSpec]
     public let abstain: AbstainPolicy?
-    public let examples: [FewShotExample]
     public let teacher: TeacherSpec
-    public let budget: BudgetSpec
     public let dataset: DatasetSpec
     public let student: StudentSpec
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case specVersion = "spec_version", name, version, description, instructions, input, labels, abstain, examples, teacher, budget, dataset, student
+        case specVersion = "spec_version", name, version, description, instructions, input, labels, abstain, teacher, dataset, student
     }
 
     public init(from decoder: Decoder) throws {
@@ -37,9 +34,7 @@ public struct TaskSpec: Codable, Sendable {
         input = try c.decode(InputSchema.self, forKey: .input)
         labels = try c.decode([LabelSpec].self, forKey: .labels)
         abstain = try c.decodeIfPresent(AbstainPolicy.self, forKey: .abstain)
-        examples = try c.decodeIfPresent([FewShotExample].self, forKey: .examples) ?? []
         teacher = try c.decode(TeacherSpec.self, forKey: .teacher)
-        budget = try c.decodeIfPresent(BudgetSpec.self, forKey: .budget) ?? BudgetSpec()
         dataset = try c.decodeIfPresent(DatasetSpec.self, forKey: .dataset) ?? DatasetSpec()
         student = try c.decodeIfPresent(StudentSpec.self, forKey: .student) ?? StudentSpec()
     }
@@ -81,21 +76,14 @@ public struct TaskSpec: Codable, Sendable {
 
         try input.validate()
         try validateLabels()
-        try teacher.validate()
-        try budget.validate(networked: teacher.provider.isNetworked)
+        try teacher.validate(labels: labels.count, hasAbstain: abstain != nil)
         try dataset.validate()
         try student.validate()
-
-        for (index, example) in examples.enumerated() {
-            _ = try input.parse(example.input, context: "examples[\(index)].input")
-            guard labelIndex(example.label) != nil else { throw DistillError.invalidSpec("examples[\(index)].label '\(example.label)' is not a declared label") }
-        }
     }
 
     private func validateLabels() throws {
         guard (2...Self.maxLabels).contains(labels.count) else { throw DistillError.invalidSpec("labels must contain 2-\(Self.maxLabels) entries") }
         guard Set(labels.map(\.name)).count == labels.count else { throw DistillError.invalidSpec("label names must be unique") }
-        guard examples.count <= Self.maxExamples else { throw DistillError.invalidSpec("at most \(Self.maxExamples) few-shot examples") }
 
         for label in labels {
             guard matches(label.name, "^[a-z][a-z0-9_-]{0,31}$") else { throw DistillError.invalidSpec("label '\(label.name)' must match ^[a-z][a-z0-9_-]{0,31}$") }
@@ -122,8 +110,9 @@ public struct LabelSpec: Codable, Sendable {
     }
 }
 
-/// When the student's top probability is below `min_confidence`, it answers
-/// `label` instead (for example `ask`). The teacher is told about the same label.
+/// The abstain label (for example `ask`) is both where uncertain Laya answers
+/// go (`teacher.uncertain: abstain`) and what the student serves when its own
+/// top probability is below `min_confidence`.
 public struct AbstainPolicy: Codable, Sendable {
     public let label: String
     public let minConfidence: Double
@@ -134,19 +123,6 @@ public struct AbstainPolicy: Codable, Sendable {
         let c = try decoder.strictContainer(keyedBy: CodingKeys.self, context: "abstain")
         label = try c.decode(String.self, forKey: .label)
         minConfidence = try c.decode(Double.self, forKey: .minConfidence)
-    }
-}
-
-public struct FewShotExample: Codable, Sendable {
-    public let input: JSONValue
-    public let label: String
-
-    enum CodingKeys: String, CodingKey, CaseIterable { case input, label }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.strictContainer(keyedBy: CodingKeys.self, context: "examples[]")
-        input = try c.decode(JSONValue.self, forKey: .input)
-        label = try c.decode(String.self, forKey: .label)
     }
 }
 

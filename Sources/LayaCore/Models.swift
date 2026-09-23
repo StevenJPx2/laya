@@ -12,14 +12,6 @@ public struct Question: Codable, Sendable {
     }
 }
 
-/// Frozen Laya representation of one question: pooled vector, raw option logits
-/// in `options` order, and the rendered option strings.
-public struct Representation: Sendable {
-    public let pooled: [Double]
-    public let logits: [Double]
-    public let options: [String]
-}
-
 public struct PredictRequest: Codable, Sendable {
     public let state: JSONValue
     public let questions: [String: Question]

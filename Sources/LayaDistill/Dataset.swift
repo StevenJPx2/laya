@@ -1,8 +1,9 @@
 import Foundation
 import LayaCore
 
-/// One dataset row. `gold` is an optional human label, used by the `dataset`
-/// teacher and reported separately from teacher agreement during evaluation.
+/// One dataset row. `gold` is an optional human label. Gold rows are
+/// evaluation-only: the student never trains on them, so accuracy against
+/// humans is measured on inputs it has not seen.
 public struct DatasetExample: Sendable {
     public let id: String
     public let input: TaskInput
@@ -96,49 +97,65 @@ public enum Dataset {
     }
 }
 
-public enum LabelStatus: String, Codable, Sendable { case ok, invalid, refused, error }
-
-/// One teacher decision. Prompts and inputs are never stored, only the
-/// example id, its content hash, the label, and usage/cost accounting.
+/// One Laya teacher decision with its provenance. Inputs are never stored,
+/// only the row id, its content hash, and what Laya answered.
 public struct LabelRecord: Codable, Sendable {
     public let id: String
     public let contentHash: String
-    public let label: String?
-    public let status: LabelStatus
-    public let reason: String?
+    /// Hash of the exact Laya question; labels for another question are stale.
+    public let questionSha256: String
     public let teacher: String
-    public let inputTokens: Int
-    public let outputTokens: Int
-    public let costUsd: Double
+    public let status: LabelStatus
+    /// Laya's top label before the confidence gate.
+    public let layaLabel: String?
+    /// The label used for training, or nil when the row is excluded.
+    public let label: String?
+    public let probabilities: [String: Double]?
+    public let top: Double?
+    public let margin: Double?
+    /// Laya's own entropy-based confidence and action probability, for audit.
+    public let layaConfidence: Double?
+    public let actProbability: Double?
+    public let reason: String?
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case id, contentHash = "content_hash", label, status, reason, teacher
-        case inputTokens = "input_tokens", outputTokens = "output_tokens", costUsd = "cost_usd"
+        case id, contentHash = "content_hash", questionSha256 = "question_sha256", teacher, status
+        case layaLabel = "laya_label", label, probabilities, top, margin
+        case layaConfidence = "laya_confidence", actProbability = "act_probability", reason
     }
 
-    public init(id: String, contentHash: String, label: String?, status: LabelStatus, reason: String?, teacher: String, inputTokens: Int, outputTokens: Int, costUsd: Double) {
+    public init(id: String, contentHash: String, questionSha256: String, teacher: String, status: LabelStatus, layaLabel: String?, label: String?,
+                probabilities: [String: Double]?, top: Double?, margin: Double?, layaConfidence: Double?, actProbability: Double?, reason: String?) {
         self.id = id
         self.contentHash = contentHash
-        self.label = label
-        self.status = status
-        self.reason = reason
+        self.questionSha256 = questionSha256
         self.teacher = teacher
-        self.inputTokens = inputTokens
-        self.outputTokens = outputTokens
-        self.costUsd = costUsd
+        self.status = status
+        self.layaLabel = layaLabel
+        self.label = label
+        self.probabilities = probabilities
+        self.top = top
+        self.margin = margin
+        self.layaConfidence = layaConfidence
+        self.actProbability = actProbability
+        self.reason = reason
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.strictContainer(keyedBy: CodingKeys.self, context: "label row")
         id = try c.decode(String.self, forKey: .id)
         contentHash = try c.decode(String.self, forKey: .contentHash)
-        label = try c.decodeIfPresent(String.self, forKey: .label)
-        status = try c.decode(LabelStatus.self, forKey: .status)
-        reason = try c.decodeIfPresent(String.self, forKey: .reason)
+        questionSha256 = try c.decode(String.self, forKey: .questionSha256)
         teacher = try c.decode(String.self, forKey: .teacher)
-        inputTokens = try c.decode(Int.self, forKey: .inputTokens)
-        outputTokens = try c.decode(Int.self, forKey: .outputTokens)
-        costUsd = try c.decode(Double.self, forKey: .costUsd)
+        status = try c.decode(LabelStatus.self, forKey: .status)
+        layaLabel = try c.decodeIfPresent(String.self, forKey: .layaLabel)
+        label = try c.decodeIfPresent(String.self, forKey: .label)
+        probabilities = try c.decodeIfPresent([String: Double].self, forKey: .probabilities)
+        top = try c.decodeIfPresent(Double.self, forKey: .top)
+        margin = try c.decodeIfPresent(Double.self, forKey: .margin)
+        layaConfidence = try c.decodeIfPresent(Double.self, forKey: .layaConfidence)
+        actProbability = try c.decodeIfPresent(Double.self, forKey: .actProbability)
+        reason = try c.decodeIfPresent(String.self, forKey: .reason)
     }
 }
 
@@ -177,6 +194,9 @@ public enum LabelStore {
     }
 
     static func fingerprint(_ records: [String: LabelRecord]) -> String {
-        Canonical.sha256(records.keys.sorted().map { "\($0)\t\(records[$0]!.contentHash)\t\(records[$0]!.label ?? "-")" }.joined(separator: "\n"))
+        Canonical.sha256(records.keys.sorted().map { id in
+            let record = records[id]!
+            return "\(id)\t\(record.contentHash)\t\(record.questionSha256)\t\(record.teacher)\t\(record.status.rawValue)\t\(record.label ?? "-")"
+        }.joined(separator: "\n"))
     }
 }

@@ -8,9 +8,10 @@ Silicon. It runs the ModernBERT-large encoder and Laya decision heads through
 - **`laya-daemon`** — a long-running daemon that keeps the model warm and serves
   newline-delimited JSON over a Unix socket at
   `~/Library/Application Support/laya/laya.sock` (override with `LAYA_SOCKET`).
-- **`laya-distill`** — define your own classification task, label it with a
-  configurable teacher, train a task-specific head, evaluate it, and serve it
-  from the same daemon ([Task-specific classifiers](#task-specific-classifiers)).
+- **`laya-distill`** — define a classification task, have Laya label it as the
+  teacher, train a small student that runs without Laya, evaluate it against
+  Laya and human gold labels, and serve it from the same daemon
+  ([Task-specific classifiers](#task-specific-classifiers)).
 
 The prompt formatting, marker extraction, softmax/entropy/act features, and
 temperature calibration match the Python MLX reference exactly. All **63
@@ -26,7 +27,7 @@ Swift 6, macOS 15+.
 | `Sources/LayaCore` | Library: tokenizer, prompt build, Core ML runtime, socket server, schema |
 | `Sources/laya-daemon` | Warm daemon over the Unix socket |
 | `Sources/laya` | CLI client: `predict`, `classify`, `health`, `bench` |
-| `Sources/LayaDistill` | Task spec, teacher labeling, split, student training, evaluation, artifacts |
+| `Sources/LayaDistill` | Task spec, Laya teacher and confidence gate, split, student training, evaluation, artifacts |
 | `Sources/laya-distill` | CLI: `init`, `validate`, `label`, `train`, `eval`, `predict` |
 | `tools/convert` | One-time Core ML export (its own `uv` project) |
 | `tools/generate_golden.py` | Regenerate parity fixtures from the Python reference |
@@ -173,39 +174,22 @@ The result schema matches the reference: each answer has `type`, `confidence`,
 
 ## Task-specific classifiers
 
-`laya-distill` turns a task you define — input schema, labels, abstain policy,
-examples — into a small **trained** classifier, evaluates it on held-out data,
-and serves it from `laya-daemon`.
-
-### What is actually trained
-
-The student is a **softmax-regression head with learned, task-specific
-weights**, trained natively in Swift (full-batch Adam, L2, optional balanced
-class weights). No new dependencies, no Python at training or serving time. It
-trains on one of two feature sets:
-
-| `student.features` | Input to the head | Needs the Laya model |
-|---|---|---|
-| `laya` | Frozen Laya representation: the 1,024-d pooled decision vector plus Laya's raw logit for each of your labels, from one ANE forward pass | yes |
-| `hashed` | Hashed word unigrams/bigrams (global and per field), log-TF, L2-normalized | no |
-
-What is **not** trained: the 421M-parameter encoder and Laya's own heads stay
-frozen. Neither this repo nor `laya-mlx` contains a training path for them
-(`laya-mlx` states RLCD training and fine-tuning live upstream), so encoder
-fine-tuning is out of scope. The **Laya zero-shot** row in every report is the
-stock checkpoint answering your task as a generic `choice` question; it is an
-untrained baseline, not a distilled model.
+`laya-distill` uses **Laya as the teacher** for small, task-specific students:
 
 ```text
-task.json ──► label (teacher, bounded) ──► labels.jsonl
-data.jsonl ─┘                                   │
-                  split (dedup, groups, leakage) ▼
-          features (Laya ANE or hashed) ──► train head ──► evaluate on holdout
-                                                               │
-                        <name>.classifier.json (weights + spec + provenance + report)
-                                                               │
-                         laya-distill predict  /  laya-daemon {"op":"classify"}
+unlabeled rows ──► ask Laya a task question (choice / noul / score) ──► confidence gate ──► labels.jsonl
+                     (installed daemon or local runtime)                 uncertain → abstain label or drop
+labels.jsonl ──► train a hashed n-gram softmax student ──► evaluate vs Laya (holdout) and vs human gold
+                                                        ──► <name>.classifier.json  (runs without Laya)
 ```
+
+The student is a softmax-regression head with learned weights over hashed word
+unigrams and bigrams. It is trained natively in Swift with no new
+dependencies. It does **not** use Laya embeddings, and serving it loads no Laya
+model: `laya-distill predict` and the daemon's `classify` op read only the
+artifact. Laya is needed only by `label`.
+
+Nothing here fine-tunes Laya itself; the checkpoint and its heads are unchanged.
 
 ### Workflow
 
@@ -213,195 +197,217 @@ data.jsonl ─┘                                   │
 swift build -c release
 B=.build/release/laya-distill
 
-$B init tasks/permission --template permission     # task.json + 60 example rows
-$B validate tasks/permission/task.json
-$B label tasks/permission/task.json --data tasks/permission/data.jsonl --labels tasks/permission/labels.jsonl
-$B train tasks/permission/task.json --data tasks/permission/data.jsonl --labels tasks/permission/labels.jsonl \
-    --out tasks/permission/permission.classifier.json --report tasks/permission/report.md \
-    --model build/laya.mlpackage --assets build/assets
-$B eval tasks/permission/permission.classifier.json --data tasks/permission/data.jsonl --labels tasks/permission/labels.jsonl \
-    --model build/laya.mlpackage --assets build/assets
-$B predict tasks/permission/permission.classifier.json --model build/laya.mlpackage --assets build/assets \
-    --input '{"tool":"Bash","request":"cat ~/.aws/credentials"}'
+$B init tasks/routing --template routing            # task.json + 60 unlabeled pool rows + 48 gold rows
+$B validate tasks/routing/task.json
+
+# Label with the installed daemon (default), or in-process with --teacher runtime.
+$B label tasks/routing/task.json --data tasks/routing/data.jsonl --labels tasks/routing/labels.jsonl
+$B label tasks/routing/task.json --data tasks/routing/data.jsonl --labels tasks/routing/labels.jsonl \
+    --teacher runtime --model build/laya.mlpackage --assets build/assets
+
+# Everything below runs without Laya.
+$B train tasks/routing/task.json --data tasks/routing/data.jsonl --labels tasks/routing/labels.jsonl \
+    --out tasks/routing/routing.classifier.json --report tasks/routing/report.md
+$B eval tasks/routing/routing.classifier.json --data tasks/routing/data.jsonl --labels tasks/routing/labels.jsonl
+$B predict tasks/routing/routing.classifier.json --input '{"subject":"Refund","body":"I was charged twice."}'
 ```
 
-Serve every `*.classifier.json` in a directory from the warm daemon:
+`label` is resumable and bounded: it asks Laya only about rows without a
+current record, `--limit N` caps a run, and five consecutive teacher errors stop
+it. It labels gold rows too, so Laya itself can be scored against humans. These
+labels are never trained on.
+
+Serve every `*.classifier.json` in a directory from the daemon:
 
 ```sh
-laya-daemon build/laya.mlpackage build/assets --classifiers tasks/permission   # or LAYA_CLASSIFIERS=<dir>
-laya classify permission input.json
-printf '%s\n' '{"op":"classify","classifier":"permission","input":{"tool":"Bash","request":"ls"}}' \
+laya-daemon build/laya.mlpackage build/assets --classifiers tasks/routing   # or LAYA_CLASSIFIERS=<dir>
+laya classify routing input.json
+printf '%s\n' '{"op":"classify","classifier":"routing","input":{"body":"The app crashes on launch."}}' \
   | nc -U "$HOME/Library/Application Support/laya/laya.sock"
-# {"abstained":false,"argmax":"…","classifier":"permission","confidence":…,"label":"…","probabilities":{"allow":…,"ask":…,"deny":…},"version":"0.1.0"}
 ```
 
-`{"op":"classifiers"}` lists what is loaded. The daemon refuses to start if
-any artifact fails validation, and existing `predict`/`health` requests are
-unchanged.
+`{"op":"classifiers"}` lists loaded students. The daemon refuses to start if
+any artifact fails validation. Existing `predict` and `health` requests are
+unchanged. `LAYA_SOCKET` overrides the socket path for the daemon, `laya`, and
+`laya-distill`.
 
-### The task spec (`spec_version: 1`)
+### The task spec (`spec_version: 2`)
 
-Strict JSON: every object rejects unknown fields, so a typo fails instead of
-silently falling back to a default. The permission template, abridged:
+Strict JSON: every object rejects unknown fields. The routing template:
 
 ```json
 {
-  "spec_version": 1, "name": "permission", "version": "0.1.0",
-  "instructions": "An autonomous coding agent wants to run the tool call below…",
+  "spec_version": 2, "name": "routing", "version": "0.1.0",
+  "instructions": "A customer sent the support message below. Which team should handle it?",
   "input": {"fields": [
-    {"name": "tool", "type": "string", "max_chars": 64},
-    {"name": "request", "type": "string", "max_chars": 2000},
-    {"name": "context", "type": "string", "required": false, "max_chars": 2000}
+    {"name": "subject", "type": "string", "required": false, "max_chars": 200},
+    {"name": "body", "type": "string", "max_chars": 4000}
   ]},
   "labels": [
-    {"name": "allow", "description": "read-only or clearly scoped, reversible work inside the project workspace"},
-    {"name": "deny", "description": "destructive, credential-exposing, privilege-escalating, or exfiltrating actions"},
-    {"name": "ask", "description": "plausibly legitimate but consequential or ambiguous; needs confirmation"}
+    {"name": "billing", "description": "invoices, payments, charges, refunds, and existing subscriptions"},
+    {"name": "technical", "description": "bugs, errors, outages, login problems, and how to use the product"},
+    {"name": "sales", "description": "new purchases, quotes, demos, and pricing for prospective customers"},
+    {"name": "other", "description": "anything else, or no clear team"}
   ],
-  "abstain": {"label": "ask", "min_confidence": 0.55},
-  "examples": [{"input": {"tool": "Bash", "request": "git push origin main"}, "label": "ask"}],
-  "teacher": {"provider": "dataset", "model": "gold"},
-  "budget": {"max_requests": 0, "max_usd": 0},
-  "dataset": {"max_examples": 5000, "holdout_fraction": 0.3, "split_seed": "permission-v1"},
-  "student": {"features": "laya", "epochs": 300, "learning_rate": 0.05,
-              "l2_grid": [0.001, 0.01, 0.1, 1, 3], "class_weighting": "balanced"}
+  "abstain": {"label": "other", "min_confidence": 0.5},
+  "teacher": {"question_type": "choice", "min_confidence": 0.6, "min_margin": 0.2, "uncertain": "abstain"},
+  "dataset": {"max_examples": 5000, "holdout_fraction": 0.3, "split_seed": "routing-v1"},
+  "student": {"hash_dimensions": 4096, "epochs": 300, "learning_rate": 0.05,
+              "l2_grid": [0.0001, 0.001, 0.01, 0.1], "class_weighting": "balanced"}
 }
 ```
 
-- **Input schema** — `string`, `number`, `boolean`, or `json` fields with
-  `required` and `max_chars`. Undeclared, missing, mistyped, or oversized
-  fields are rejected at training, prediction, and daemon time alike.
-- **Abstain** — when the student's top probability is below `min_confidence`
-  it answers the abstain label (here `ask`); the teacher is told to use the
-  same label when an input is ambiguous. Reports show both raw argmax and the
-  served (abstain-applied) result.
-- **Dataset rows** (`data.jsonl`) — `{"id", "input", "group"?, "gold"?}`.
-  `group` keeps related rows (paraphrases, one conversation) on one side of the
-  split. `gold` is an optional human label.
+- **`teacher.question_type`**: how the task is asked of Laya.
+  - `choice`: one option per label, `name: description`.
+  - `noul`: exactly two labels, false first and true second; Laya's `P(true)`
+    becomes the second label's probability.
+  - `score`: labels are ordered rubric levels, lowest first.
+- **Confidence gate**: a Laya answer becomes a hard training label only if its
+  top probability is at least `min_confidence` and it leads the runner-up by at
+  least `min_margin`. Otherwise it is `uncertain`, and `uncertain` decides what
+  happens to it:
+  - `abstain` trains the row as the abstain label (`other` here, `ask` for a
+    permission task), never as Laya's argmax;
+  - `drop` excludes the row from training.
+- **`abstain`** is also the student's serving policy: below its
+  `min_confidence`, the student answers the abstain label.
+- **Input schema**: `string`, `number`, `boolean`, or `json` fields with
+  `required` and `max_chars`. Undeclared, missing, mistyped, or oversized fields
+  are rejected at labeling, training, prediction, and daemon time alike.
+- **Dataset rows** (`data.jsonl`): `{"id", "input", "group"?, "gold"?}`.
+  - Rows with `gold` (a human label) are **evaluation-only**.
+  - `group` keeps related rows (paraphrases, one conversation) together.
 
-A routing task is the same shape — for example labels `billing` / `technical` /
-`sales` over `{"subject", "body"}` fields, with `abstain` pointing at an
-`other` or `human_review` label.
+### Label records and provenance
 
-### Teachers, budgets, and keys
+Each `labels.jsonl` row records the id, the content hash, a hash of the exact
+Laya question, and the teacher identity. For example:
 
-The teacher is configured per task; nothing is assumed. `teacher.model` must be
-set explicitly (this build agent's own model is not a default).
+- `laya-daemon:laya-typed-decisions`, or
+- `laya-runtime:laya-typed-decisions@<asset fingerprint>`.
 
-| `provider` | Request | Notes |
-|---|---|---|
-| `anthropic` | Messages API with `output_config.format` JSON schema (label `enum`) | [Structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs) |
-| `openai-compatible` | Chat Completions with `response_format: json_schema, strict: true` at `base_url` | OpenAI, or local servers such as vLLM/Ollama; loopback may use `http` |
-| `dataset` | none — uses each row's `gold` label | free, offline |
+It also records:
 
-```json
-"teacher": {"provider": "anthropic", "model": "<model id you choose>", "api_key_env": "ANTHROPIC_API_KEY",
-            "max_output_tokens": 16, "pricing": {"input_usd_per_mtok": 3.0, "output_usd_per_mtok": 15.0}},
-"budget": {"max_requests": 500, "max_usd": 2.0}
-```
+- the status (`accepted`, `uncertain`, or `error`);
+- Laya's raw top label and the gated training label;
+- every per-label probability, the top probability, and the margin;
+- Laya's own confidence and action probability.
 
-- **Keys are environment-only.** The spec names the variable
-  (`api_key_env`); an inline `api_key` is rejected as an unknown field. The key
-  is read only when `--approve` is given.
-- **Nothing is sent without `--approve`.** Without it `label` prints a plan:
-  pending rows, selected rows, estimated input tokens, and a worst-case cost.
-- **Budgets are cumulative.** `max_requests` and `max_usd` cover every run
-  against the same label file, so resuming cannot exceed them. Before each
-  request the worst case (estimated input + `max_output_tokens`) must fit;
-  actual usage reported by the provider is billed, and the worst case is
-  charged when usage is missing. Five consecutive failures stop the run;
-  429/5xx/transport errors retry at most `max_retries` times with backoff.
-- **You supply `pricing`.** Prices change; copy current per-MTok prices from
-  your provider. Cost ≈ `requests × (input_tokens × input_price +
-  output_tokens × output_price) / 1e6`. The input estimate is conservative
-  (~3 bytes/token) and is used only to refuse or stop before spending. On the
-  60-row template, a dry run with the illustrative prices above planned 25
-  requests (the `max_requests` it was given) at a worst case of $0.0324.
-- **Replies are validated.** Only a declared label is accepted; casing is
-  normalized because Anthropic's docs note enum casing isn't guaranteed.
-  Refusals, `max_tokens`, and malformed replies are recorded as
-  `refused`/`invalid` and excluded from training.
-- **No prompts or inputs are persisted or logged.** Label rows store id,
-  content hash, label, status, token counts, and cost. Logs show only a hash
-  prefix and status; provider error text is shortened and redacted (emails,
-  long tokens, phone numbers).
+Inputs are never persisted. Changing the instructions, labels, or question type
+changes the question hash, so earlier labels become stale and are asked again.
 
 ### Split and leakage controls
 
-- Inputs are hashed after rendering in schema order, lowercasing, and
-  collapsing whitespace; duplicates collapse, and duplicates with conflicting
-  teacher labels are dropped.
-- Train/holdout assignment is a deterministic hash of `split_seed` and the
-  row's `group` (or content hash), so a group never straddles the split.
-- Rows identical to a few-shot example shown to the teacher never enter holdout.
-- Labels whose content hash no longer matches the row are treated as stale.
-- `l2_grid` selects L2 by group-aware 5-fold cross-validation on the **training
-  split only**; the holdout is never used for model selection.
-- Artifacts store the training rows' content hashes. `eval` re-derives the split
-  and excludes, and reports, any holdout row that was trained on.
+- **Gold is evaluation-only.** Pool rows that share a gold row's content or
+  `group` are also kept out of training, so student-vs-human accuracy is
+  measured on inputs nothing was trained on.
+- **Duplicates.** Inputs are hashed after rendering in schema order,
+  lowercasing, and collapsing whitespace. Duplicates collapse, and duplicates
+  with conflicting labels are dropped.
+- **Deterministic holdout.** Train and the Laya holdout are assigned by a hash
+  of `split_seed` and the row's `group` (or content hash), so a group never
+  straddles the split.
+- **Model selection uses train only.** `l2_grid` picks L2 by group-aware 5-fold
+  cross-validation on the training split.
+- **Re-evaluation stays clean.** Artifacts store the training rows' content
+  hashes. `eval` re-derives the split, then excludes and reports any evaluation
+  row that was trained on.
 
 ### Artifacts
 
-`<name>.classifier.json` (`format: laya.classifier`, `format_version: 1`)
-contains the normalized spec and its SHA-256, the feature descriptor, weights
-and standardization statistics (fitted on train only), provenance (teacher,
-dataset and label fingerprints, training hashes, chosen L2 and CV scores), the
-holdout report, and an integrity hash verified on load. `laya` artifacts also
-record an asset fingerprint (runtime manifest, action-head weights, first 4 MiB
-of embeddings) and refuse to load against different Laya assets.
+`<name>.classifier.json` (`format: laya.classifier`, `format_version: 2`)
+contains:
 
-### Measured result: the permission template
+- the normalized spec and its SHA-256;
+- the feature scheme (`hashed-ngram-v1`), weights, and biases;
+- provenance: teacher identity, question hash, dataset and label fingerprints,
+  training content hashes, and the chosen L2 with its CV scores;
+- the evaluation report;
+- an integrity hash, verified on load.
 
-These numbers come from running the commands above on this machine
-(`laya` features, `dataset` teacher = the template's hand-written labels). They
-show the pipeline works; **they are not evidence of a useful permission gate.**
-The 60 rows are synthetic and the holdout has 19 rows, so one row moves
-accuracy by 5.3 points.
+### Measured results
 
-| Holdout, n = 19 | Accuracy | Macro-F1 |
-|---|---:|---:|
-| Student, argmax | 36.8% | 0.363 |
-| Student, served (abstain rate 10.5%) | 47.4% | 0.469 |
-| Laya zero-shot choice (untrained) | 47.4% | 0.287 |
-| Majority class (`allow`) | 15.8% | 0.091 |
+Both templates were run end to end on this machine with the real Laya runtime
+as teacher, using the commands above. All rows are synthetic, and the sets are
+tiny: one row is about 2 points on gold (n = 48) and 5.6 points on the routing
+holdout (n = 18).
 
-Cross-validation on the 41 training rows chose `l2 = 0.01` at 43.9% accuracy,
-consistent with the holdout. With a fixed `l2 = 0.001` and no selection, the
-same data gave 31.6% on holdout — below zero-shot — which is why the template
-uses `l2_grid`. Hashed features on the same split scored 52.6% served, but only
-by abstaining to `ask` on 52.6% of rows. All of these differences are within
-noise at this size. In one daemon check the model answered `ask` for
-`sudo rm -rf / --no-preserve-root`, which should be `deny`.
+**Routing** (60 pool rows, 48 gold rows):
 
-To get a usable classifier, label hundreds to thousands of representative rows
-with a strong teacher (or humans), keep `gold` labels on a subset to measure the
-teacher itself (`teacher_vs_gold`), and ship only if the student beats both
-baselines on held-out data by more than the noise.
+| Reference | Model | n | Accuracy | Macro-F1 |
+|---|---|---:|---:|---:|
+| Human gold | Laya teacher, raw argmax | 48 | 85.4% | 0.782 |
+| Human gold | Laya teacher, confidence-gated | 48 | 70.8% | 0.674 |
+| Human gold | Student, argmax | 48 | 43.8% | 0.409 |
+| Human gold | Student, served (abstain to `other`) | 48 | 12.5% | 0.056 |
+| Human gold | Majority class | 48 | 12.5% | 0.056 |
+| Laya labels | Student, argmax | 18 | 55.6% | 0.317 |
+| Laya labels | Majority class | 18 | 38.9% | 0.140 |
+
+- **Laya is a strong teacher for routing.** Every gold row that passed the gate
+  was labeled correctly (28 of 28).
+- **The gate costs coverage.** It sent 46 of 108 answers to `other`, and only
+  4 pool rows kept a confident `sales` label.
+- **The student is not usable.** Trained on 42 rows, it gives diffuse
+  probabilities. Its serving threshold (`other` below 0.5) fired on every gold
+  row, so the served student equals the majority baseline.
+
+The fix is more unlabeled data, which Laya labels locally, at about 20 ms for a
+short row (see [Benchmarks](#benchmarks)).
+Thresholds were not tuned against these evaluation sets.
+
+**Permission** (`--template permission`: 60 pool rows, 60 gold allow/deny/ask
+rows): this template is a negative result. Laya answered `ask` for 111 of 120
+rows and matched human gold on 20 of 60 (33%), including `ask` for every `allow`
+row. `train` then refused to build a student, because the confident labels
+covered only one class. **Do not use either template's student as a permission
+gate, router, or any other safety or production control.**
+
+The takeaway is to trust a student only after the gold report shows Laya
+itself is accurate for your question, and only if the student beats the
+majority baseline on both references by more than noise.
 
 ### Limitations
 
-- Only a linear head is trained; the encoder is frozen. Laya's 512-token context
-  applies to `laya` features.
-- Hard teacher labels only; no soft-label or logit distillation.
-- Training is full-batch and in memory. It has been exercised only at the test
-  and template sizes here (≤ 60 rows); larger datasets are untested. Laya
-  features cost one ANE forward pass per row (about 20 ms at the 128-token
-  bucket; see Benchmarks).
-- Rows are bounded by `dataset.max_examples` and `max_line_bytes`, and teacher
-  output by `max_output_tokens`.
-- The Laya asset fingerprint is a cheap compatibility check, not a hash of every
-  weight.
+- The student is a linear model over hashed n-grams; it is only as good as the
+  volume and quality of Laya's confident labels.
+- Training uses hard labels only; Laya's probabilities are recorded but not used
+  as soft targets.
+- Laya reads at most 512 tokens per question. Longer inputs are truncated by
+  Laya's own prompt builder when labeling.
+- Training is full-batch and in memory, and has been run only at these template
+  and test sizes (≤ 120 rows).
+- The runtime teacher's asset fingerprint is a cheap compatibility check
+  (runtime manifest, action-head weights, first 4 MiB of embeddings), not a hash
+  of every weight. The daemon teacher reports only the model name.
 
 ### Tests
 
-`swift test` runs the distillation suite offline: strict spec parsing, input
-validation, bounded loading, the split and leakage controls, Anthropic and
-OpenAI-compatible request/response shapes, dry-run and cumulative budget
-enforcement, bounded retries, redaction, and an end-to-end tiny classifier
-(teacher labels through a stub transport, training, artifact save/load,
-prediction, re-evaluation, daemon `classify`, tamper rejection). No test makes a
-network call. `LayaFeatureTests` trains on real Laya representations and runs
-only when `LAYA_MODEL` and `LAYA_ASSETS` are set.
+`swift test` runs 15 offline tests with a deterministic fake Laya teacher and
+no model:
+
+- strict spec parsing and input validation;
+- bounded loading;
+- gold-only evaluation and the leakage controls;
+- exact gate boundaries, including the floating-point margin edge;
+- `choice`, `noul`, and `score` question mapping;
+- labeler resume, staleness, limits, and the error stop;
+- an end-to-end student (label, train, save, reload, predict without Laya,
+  re-evaluate), daemon `classify`, tamper rejection, and CV selection.
+
+Two tests need real Laya:
+
+- `LayaTeacherTests/testRealRuntimeLabelsAndStudentRunsWithoutLaya` runs with
+  `LAYA_MODEL` and `LAYA_ASSETS`. The real runtime labels the routing template,
+  then the test trains, saves, reloads, and predicts with no Laya object in
+  scope.
+- `testDaemonTeacherWhenAvailable` runs with `LAYA_TEST_SOCKET` pointing at a
+  running daemon.
+
+These tests need Apple Silicon, macOS 15, and the exported `build/laya.mlpackage`
+and `build/assets`. The first load of a new package spends about a minute
+compiling the Core ML model; later loads use the cached `.mlmodelc`. Without the
+model they skip rather than fail.
 
 ## Parity gate
 

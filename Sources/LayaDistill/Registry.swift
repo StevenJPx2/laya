@@ -12,7 +12,7 @@ public struct ClassifierRegistry: Sendable {
 
     /// Load every `*.classifier.json` in `directory`. Any invalid artifact fails
     /// startup rather than being skipped silently.
-    public static func load(directory: URL, runtime: LayaRuntime, assets: URL) throws -> ClassifierRegistry {
+    public static func load(directory: URL) throws -> ClassifierRegistry {
         let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasSuffix(suffix) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
@@ -25,7 +25,7 @@ public struct ClassifierRegistry: Sendable {
             let artifact = try ClassifierArtifact.load(file)
             guard classifiers[artifact.spec.name] == nil else { throw DistillError.artifact("duplicate classifier name \(artifact.spec.name)") }
 
-            classifiers[artifact.spec.name] = try Classifier(artifact: artifact, runtime: runtime, assets: assets)
+            classifiers[artifact.spec.name] = Classifier(artifact: artifact)
         }
 
         return ClassifierRegistry(classifiers: classifiers)
@@ -40,14 +40,14 @@ public struct ClassifierRegistry: Sendable {
     public func handle(op: String, line: Data) async throws -> Data {
         switch op {
         case "classifiers":
-            let entries = names.map { ["name": $0, "version": classifiers[$0]!.artifact.spec.version, "features": classifiers[$0]!.artifact.features.kind.rawValue] }
+            let entries = names.map { ["name": $0, "version": classifiers[$0]!.artifact.spec.version, "teacher": classifiers[$0]!.artifact.training.teacher] }
             return try Canonical.encoder().encode(["classifiers": entries])
 
         case "classify":
             let request = try JSONDecoder().decode(ClassifyRequest.self, from: line)
             guard let classifier = classifiers[request.classifier] else { throw DistillError.invalidData("unknown classifier \(request.classifier)") }
 
-            return try Canonical.encoder().encode(try await classifier.predict(request.input))
+            return try Canonical.encoder().encode(try classifier.predict(request.input))
 
         default:
             throw DistillError.invalidData("unknown op \(op)")

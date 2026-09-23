@@ -2,7 +2,9 @@ import Foundation
 import LayaCore
 
 public struct TrainingInfo: Codable, Sendable {
+    /// Laya teacher identities whose labels trained this student.
     public let teacher: String
+    public let questionSha256: String
     public let examples: Int
     public let epochs: Int
     public let l2: Double
@@ -10,24 +12,27 @@ public struct TrainingInfo: Codable, Sendable {
     public let selection: SelectionResult?
     public let finalLoss: Double
     public let trainAccuracy: Double
+    public let labelsWithoutTrainingRows: [String]
     public let datasetSha256: String
     public let labelsSha256: String
-    /// Content hashes of training rows, so evaluation can prove holdout disjointness.
+    /// Content hashes of training rows, so evaluation can prove disjointness.
     public let trainHashes: [String]
     public let createdAt: String
 
     enum CodingKeys: String, CodingKey {
         case teacher, examples, epochs, l2, selection
-        case finalLoss = "final_loss", trainAccuracy = "train_accuracy", datasetSha256 = "dataset_sha256"
+        case questionSha256 = "question_sha256", finalLoss = "final_loss", trainAccuracy = "train_accuracy"
+        case labelsWithoutTrainingRows = "labels_without_training_rows", datasetSha256 = "dataset_sha256"
         case labelsSha256 = "labels_sha256", trainHashes = "train_hashes", createdAt = "created_at"
     }
 }
 
-/// A self-contained, versioned classifier. Everything needed to validate
-/// inputs, extract features, and apply the abstain policy travels with it.
+/// A self-contained, versioned student. Validating inputs, extracting
+/// features, and applying the abstain policy need nothing but this file;
+/// Laya is only its training-time teacher.
 public struct ClassifierArtifact: Codable, Sendable {
     public static let format = "laya.classifier"
-    public static let formatVersion = 1
+    public static let formatVersion = 2
 
     public var format = Self.format
     public var formatVersion = Self.formatVersion
@@ -90,7 +95,7 @@ public struct ClassifierArtifact: Codable, Sendable {
 
     func verify() throws {
         guard format == Self.format, formatVersion == Self.formatVersion else {
-            throw DistillError.artifact("unsupported artifact format \(format) v\(formatVersion)")
+            throw DistillError.artifact("unsupported artifact format \(format) v\(formatVersion); retrain with this version")
         }
         guard try payloadHash() == integrity else { throw DistillError.artifact("integrity check failed; the artifact was modified or truncated") }
         guard spec.sha256 == specSha256 else { throw DistillError.artifact("embedded spec does not match spec_sha256") }
@@ -98,9 +103,19 @@ public struct ClassifierArtifact: Codable, Sendable {
         try spec.validate()
         try model.validate()
 
-        guard model.classes == spec.labels.count, model.dimensions == features.dimensions else {
-            throw DistillError.artifact("model shape does not match the task labels or feature dimensions")
+        guard features.scheme == FeatureDescriptor.scheme, model.classes == spec.labels.count, model.dimensions == features.dimensions else {
+            throw DistillError.artifact("model shape does not match the task labels or feature scheme")
         }
+    }
+
+    /// Apply the abstain policy to student probabilities. Shared by serving and evaluation.
+    func decide(_ probabilities: [Double]) -> Prediction {
+        let top = argmax(probabilities)
+        let abstain = spec.abstain.flatMap { policy in probabilities[top] < policy.minConfidence ? policy.label : nil }
+        let rounded = Dictionary(uniqueKeysWithValues: zip(spec.labelNames, probabilities.map { ($0 * 10_000).rounded() / 10_000 }))
+
+        return Prediction(classifier: spec.name, version: spec.version, label: abstain ?? spec.labelNames[top], argmax: spec.labelNames[top],
+                          confidence: (probabilities[top] * 10_000).rounded() / 10_000, probabilities: rounded, abstained: abstain != nil)
     }
 }
 
@@ -115,47 +130,19 @@ public struct Prediction: Codable, Sendable {
     public let abstained: Bool
 }
 
-/// Loaded artifact plus the feature extractor it was trained with.
+/// A loaded student. Runs on hashed features only; no Laya model is involved.
 public struct Classifier: Sendable {
     public let artifact: ClassifierArtifact
-    let extractor: FeatureExtractor
+    let features: HashedFeatures
 
-    /// `runtime`/`assets` are required only for `laya` feature artifacts; the
-    /// asset fingerprint must match the one recorded at training time.
-    public init(artifact: ClassifierArtifact, runtime: LayaRuntime?, assets: URL?) throws {
-        switch artifact.features.kind {
-        case .hashed:
-            extractor = HashedFeatures(dimensions: artifact.features.dimensions)
-        case .laya:
-            guard let runtime, let assets else { throw DistillError.artifact("\(artifact.spec.name) needs the Laya model (--model/--assets)") }
-
-            let fingerprint = try LayaFeatures.fingerprint(assets: assets)
-            guard fingerprint == artifact.features.modelFingerprint else {
-                throw DistillError.artifact("\(artifact.spec.name) was trained on different Laya assets (fingerprint mismatch)")
-            }
-
-            extractor = try LayaFeatures(runtime: runtime, spec: artifact.spec, fingerprint: fingerprint, hidden: artifact.features.dimensions - artifact.spec.labels.count)
-        }
-
+    public init(artifact: ClassifierArtifact) {
         self.artifact = artifact
+        features = HashedFeatures(dimensions: artifact.features.dimensions)
     }
 
-    public func predict(_ raw: JSONValue) async throws -> Prediction {
+    public func predict(_ raw: JSONValue) throws -> Prediction {
         let input = try artifact.spec.input.parse(raw)
-        let probabilities = artifact.model.probabilities(try await extractor.extract(input).vector)
 
-        return artifact.decide(probabilities)
-    }
-}
-
-extension ClassifierArtifact {
-    /// Apply the abstain policy to student probabilities. Shared by serving and evaluation.
-    func decide(_ probabilities: [Double]) -> Prediction {
-        let top = argmax(probabilities)
-        let abstain = spec.abstain.flatMap { policy in probabilities[top] < policy.minConfidence ? policy.label : nil }
-        let rounded = Dictionary(uniqueKeysWithValues: zip(spec.labelNames, probabilities.map { ($0 * 10_000).rounded() / 10_000 }))
-
-        return Prediction(classifier: spec.name, version: spec.version, label: abstain ?? spec.labelNames[top], argmax: spec.labelNames[top],
-                          confidence: (probabilities[top] * 10_000).rounded() / 10_000, probabilities: rounded, abstained: abstain != nil)
+        return artifact.decide(artifact.model.probabilities(features.extract(input)))
     }
 }

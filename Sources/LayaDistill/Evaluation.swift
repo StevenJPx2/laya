@@ -43,57 +43,75 @@ public struct Metrics: Codable, Sendable {
     }
 }
 
-public struct Baseline: Codable, Sendable {
-    public let name: String
-    public let status: String
-    public let metrics: Metrics?
+/// Student versus Laya on Laya-labeled rows the student did not train on.
+public struct AgreementReport: Codable, Sendable {
+    /// Student argmax against the gated Laya training labels.
+    public let student: Metrics
+    /// Student with its own abstain policy applied (what `predict` serves).
+    public let served: Metrics
+    public let abstainRate: Double
+    public let majority: Metrics
+
+    enum CodingKeys: String, CodingKey { case student, served, majority, abstainRate = "abstain_rate" }
+}
+
+/// Accuracy against human `gold` labels on rows nobody trained on.
+public struct GoldReport: Codable, Sendable {
+    public let studentServed: Metrics
+    public let studentArgmax: Metrics
+    /// Laya's own top label on the gold rows that Laya labeled.
+    public let layaRaw: Metrics?
+    /// Laya after the confidence gate; rows the gate dropped are excluded.
+    public let layaGated: Metrics?
+    public let majority: Metrics
+
+    enum CodingKeys: String, CodingKey {
+        case majority, studentServed = "student_served", studentArgmax = "student_argmax", layaRaw = "laya_raw", layaGated = "laya_gated"
+    }
 }
 
 public struct EvaluationReport: Codable, Sendable {
-    public let reference: String
+    public let teacher: String
     public let split: SplitReport
-    /// Student argmax against the teacher's labels on held-out rows.
-    public let student: Metrics
-    /// Student with the abstain policy applied (what `predict` serves).
-    public let served: Metrics
-    public let abstainRate: Double
-    public let baselines: [Baseline]
-    /// Only present when held-out rows carry human `gold` labels.
-    public let studentVsGold: Metrics?
-    public let teacherVsGold: Metrics?
-
-    enum CodingKeys: String, CodingKey {
-        case reference, split, student, served, baselines
-        case abstainRate = "abstain_rate", studentVsGold = "student_vs_gold", teacherVsGold = "teacher_vs_gold"
-    }
+    public let agreement: AgreementReport?
+    public let gold: GoldReport?
 
     public var markdown: String {
         var lines = [
-            "| Model (holdout, n=\(student.examples), reference: \(reference)) | Accuracy | Macro-F1 |",
-            "|---|---:|---:|",
-            row("Student (argmax)", student),
-            row("Student (served, abstain rate \(percent(abstainRate)))", served),
+            "Teacher: \(teacher). Split: \(split.train) train / \(split.holdout) Laya holdout / \(split.gold) gold (evaluation-only).",
+            "",
+            "| Reference | Model | n | Accuracy | Macro-F1 |",
+            "|---|---|---:|---:|---:|",
         ]
 
-        for baseline in baselines {
-            if let metrics = baseline.metrics { lines.append(row(baseline.name, metrics)) } else { lines.append("| \(baseline.name) | \(baseline.status) | — |") }
+        if let agreement {
+            lines.append(row("Laya labels", "Student (argmax)", agreement.student))
+            lines.append(row("Laya labels", "Student (served, abstain rate \(percent(agreement.abstainRate)))", agreement.served))
+            lines.append(row("Laya labels", "Majority class", agreement.majority))
         }
-        if let studentVsGold, let teacherVsGold {
-            lines.append(row("Student vs gold", studentVsGold))
-            lines.append(row("Teacher vs gold", teacherVsGold))
+        if let gold {
+            lines.append(row("Human gold", "Student (served)", gold.studentServed))
+            lines.append(row("Human gold", "Student (argmax)", gold.studentArgmax))
+            if let raw = gold.layaRaw { lines.append(row("Human gold", "Laya teacher (raw argmax)", raw)) }
+            if let gated = gold.layaGated { lines.append(row("Human gold", "Laya teacher (confidence-gated)", gated)) }
+            lines.append(row("Human gold", "Majority class", gold.majority))
         }
 
         lines.append("")
-        lines.append("Split: \(split.train) train / \(split.holdout) holdout; duplicates removed \(split.duplicatesRemoved), conflicts dropped \(split.conflictsDropped), unlabeled \(split.unlabeled), stale labels \(split.staleLabels), few-shot kept out of holdout \(split.fewShotForcedToTrain), train-overlap excluded \(split.trainOverlapExcluded).")
-        lines.append("")
-        lines.append("Confusion (rows = \(reference), columns = student served): labels \(served.labels.joined(separator: ", "))")
-        lines += served.confusion.map { "    \($0.map { String(format: "%4d", $0) }.joined())" }
+        lines.append("Teacher gate on training pool: uncertain→abstain \(split.uncertainToAbstain), uncertain dropped \(split.uncertainDropped), errors \(split.teacherErrors), unlabeled \(split.unlabeled), stale \(split.staleLabels).")
+        lines.append("Leakage controls: gold-overlap excluded \(split.goldOverlapExcluded), duplicates removed \(split.duplicatesRemoved), conflicts dropped \(split.conflictsDropped), train-overlap excluded \(split.trainOverlapExcluded).")
+
+        if let gold {
+            lines.append("")
+            lines.append("Confusion vs human gold (rows = gold, columns = student served): \(gold.studentServed.labels.joined(separator: ", "))")
+            lines += gold.studentServed.confusion.map { "    \($0.map { String(format: "%4d", $0) }.joined())" }
+        }
 
         return lines.joined(separator: "\n")
     }
 
-    private func row(_ name: String, _ metrics: Metrics) -> String {
-        "| \(name) | \(percent(metrics.accuracy)) | \(String(format: "%.3f", metrics.macroF1)) |"
+    private func row(_ reference: String, _ name: String, _ metrics: Metrics) -> String {
+        "| \(reference) | \(name) | \(metrics.examples) | \(percent(metrics.accuracy)) | \(String(format: "%.3f", metrics.macroF1)) |"
     }
 }
 

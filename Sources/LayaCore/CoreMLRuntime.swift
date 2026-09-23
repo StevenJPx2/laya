@@ -60,27 +60,7 @@ public actor LayaRuntime {
         return PredictResponse(model: modelName, answers: answers, usage: Usage(input_tokens: tokenCount, output_tokens: 0))
     }
 
-    /// Frozen encoder representation for one typed question: the pooled decision
-    /// vector the checkpoint's own heads consume, plus the uncalibrated option
-    /// logits. Task-specific heads train on these without touching checkpoint weights.
-    public func representation(state: JSONValue, question: Question) throws -> Representation {
-        guard let item = try tokenizer.prepare(state: state, questions: ["q": question])["q"] else {
-            throw LayaError.invalid("question could not be prepared")
-        }
-
-        let output = try forward(item)
-
-        return Representation(pooled: output.cls, logits: Array(output.logits.prefix(item.markers.count)), options: item.options)
-    }
-
     private func infer(_ item: PromptItem) throws -> (logits: [Double], action: [Double]) {
-        let output = try forward(item)
-        let action = actionHead.predict(cls: output.cls, logits: output.logits, markerCount: item.markers.count)
-
-        return (output.logits, action)
-    }
-
-    private func forward(_ item: PromptItem) throws -> (logits: [Double], cls: [Double]) {
         let target = bucketLength(item.ids.count)
 
         guard let model = models[target] else {
@@ -97,8 +77,9 @@ public actor LayaRuntime {
 
         let logits = (0..<manifest.markerSlots).map { logitsArray[$0].doubleValue }
         let cls = (0..<manifest.hidden).map { clsArray[$0].doubleValue }
+        let action = actionHead.predict(cls: cls, logits: logits, markerCount: item.markers.count)
 
-        return (logits, cls)
+        return (logits, action)
     }
 
     private func inputProvider(item: PromptItem, target: Int) throws -> MLFeatureProvider {

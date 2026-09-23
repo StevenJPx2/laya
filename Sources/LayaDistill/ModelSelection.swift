@@ -18,7 +18,7 @@ enum ModelSelection {
     /// Choose L2 by k-fold cross-validation over the training split. Folds are
     /// assigned by the same group/content key as the train/holdout split, so a
     /// group never straddles folds. The holdout is never touched.
-    static func selectL2(_ items: [LabeledExample], rows: [SparseVector], spec: TaskSpec, dense: Bool, dimensions: Int) throws -> SelectionResult? {
+    static func selectL2(_ items: [LabeledExample], rows: [SparseVector], spec: TaskSpec, dimensions: Int) throws -> SelectionResult? {
         guard let grid = spec.student.l2Grid else { return nil }
 
         let folds = min(maxFolds, Set(items.map(key)).count)
@@ -37,7 +37,7 @@ enum ModelSelection {
                 guard !test.isEmpty, Set(train.map { items[$0].label }).count > 1 else { continue }
 
                 let result = try Trainer.train(train.map { rows[$0] }, labels: train.map { items[$0].label }, classes: spec.labels.count,
-                                               dimensions: dimensions, dense: dense, config: spec.student, l2: l2)
+                                               dimensions: dimensions, config: spec.student, l2: l2)
                 correct += test.filter { argmax(result.model.probabilities(rows[$0])) == items[$0].label }.count
                 total += test.count
             }
