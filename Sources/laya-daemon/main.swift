@@ -26,7 +26,8 @@ import LayaDistill
         var operations: UnixSocketServer.OperationHandler?
 
         if let classifiers {
-            let registry = try ClassifierRegistry.load(directory: URL(fileURLWithPath: classifiers))
+            let representations = try RuntimeRepresentations(runtime: runtime, assets: assets)
+            let registry = try ClassifierRegistry.load(directory: URL(fileURLWithPath: classifiers), representations: representations)
             fputs("laya-daemon: serving classifiers \(registry.names.joined(separator: ", "))\n", stderr)
             operations = { op, line in try await registry.handle(op: op, line: line) }
         }

@@ -8,14 +8,22 @@ usage:
   laya-distill validate <task.json>
   laya-distill label <task.json> --data <data.jsonl> --labels <labels.jsonl> [--limit N]
                      [--teacher daemon [--socket <path>] | --teacher runtime [--model <laya.mlpackage>] [--assets <dir>]]
+  laya-distill import <task.json> --data <data.jsonl> --jev <jev-ledger.jsonl> --labels <labels.jsonl>
   laya-distill train <task.json> --data <data.jsonl> --labels <labels.jsonl> --out <name.classifier.json> [--report <file.md>]
-  laya-distill eval <artifact> --data <data.jsonl> --labels <labels.jsonl> [--report <file.md>]
-  laya-distill predict <artifact> [--input '<json object>']   (otherwise reads one JSON object per stdin line)
+                     [--model <laya.mlmodelc> --assets <dir>]
+  laya-distill eval <artifact> --data <data.jsonl> --labels <labels.jsonl> [--report <file.md>] [--model <laya.mlmodelc> --assets <dir>]
+  laya-distill predict <artifact> [--input '<json object>'] [--model <laya.mlmodelc> --assets <dir>]
+                     (otherwise reads one JSON object per stdin line)
 
-Only `label` uses Laya (the teacher). The default teacher is the installed laya-daemon
+`label` asks Laya for labels. The default teacher is the installed laya-daemon
 ($LAYA_SOCKET or ~/Library/Application Support/laya/laya.sock). `--teacher runtime` loads
 Laya in-process from --model/--assets ($LAYA_MODEL/$LAYA_ASSETS, then build/…).
-train, eval, and predict run the student without Laya.
+`import` reads labels from a jev-distill ledger instead; they pass the same confidence gate.
+
+Hashed-ngram students train, evaluate, and predict without Laya; passing --model/--assets to
+train or eval adds Laya zero-shot to the gold report. laya-logits-v1 students always load Laya
+in-process from --model/--assets ($LAYA_MODEL/$LAYA_ASSETS, then
+~/Library/Application Support/laya/laya.mlmodelc and …/assets).
 """
 
 struct Arguments {
@@ -87,6 +95,20 @@ func teacher(_ args: Arguments) async throws -> LayaTeacher {
     }
 }
 
+/// Laya features for train/eval/predict: loaded when the student needs them,
+/// or when --model/--assets are passed explicitly.
+func representations(_ args: Arguments, required: Bool) async throws -> RepresentationProvider? {
+    guard required || args.value("--model") != nil || args.value("--assets") != nil else { return nil }
+
+    let environment = ProcessInfo.processInfo.environment
+    let support = NSString("~/Library/Application Support/laya").expandingTildeInPath
+    let model = URL(fileURLWithPath: args.value("--model") ?? environment["LAYA_MODEL"] ?? "\(support)/laya.mlmodelc")
+    let assets = URL(fileURLWithPath: args.value("--assets") ?? environment["LAYA_ASSETS"] ?? "\(support)/assets")
+    log("[laya] loading \(model.lastPathComponent)")
+
+    return try RuntimeRepresentations(runtime: try await LayaRuntime(modelURL: model, assetsURL: assets), assets: assets)
+}
+
 func initTask(_ args: Arguments) throws {
     let directory = try args.first()
     let name = args.value("--template") ?? "routing"
@@ -108,6 +130,7 @@ func initTask(_ args: Arguments) throws {
 
 func label(_ args: Arguments) async throws {
     let spec = try TaskSpec.load(try args.first())
+    guard spec.teacher.source == .laya else { throw DistillError.invalidData("teacher.source is import; use laya-distill import") }
     let labelsURL = try args.require("--labels")
     let examples = try Dataset.load(try args.require("--data"), spec: spec)
     let labeler = Labeler(spec: spec, examples: examples, existing: try LabelStore.load(labelsURL, maxRows: spec.dataset.maxExamples))
@@ -120,44 +143,58 @@ func label(_ args: Arguments) async throws {
     try emit(summary)
 }
 
-func train(_ args: Arguments) throws {
+func importLabels(_ args: Arguments) throws {
+    let spec = try TaskSpec.load(try args.first())
+    let labelsURL = try args.require("--labels")
+    let examples = try Dataset.load(try args.require("--data"), spec: spec)
+    if spec.teacher.source == .laya { log("[import] note: set teacher.source to import so `label` cannot overwrite these labels") }
+
+    let result = try JevImport.records(try args.require("--jev"), spec: spec, examples: examples)
+    try LabelStore.merge(result.records, into: labelsURL, maxRows: spec.dataset.maxExamples)
+    log("[import] wrote \(result.records.count) records to \(labelsURL.path)")
+    try emit(result.summary)
+}
+
+func train(_ args: Arguments) async throws {
     let spec = try TaskSpec.load(try args.first())
     let examples = try Dataset.load(try args.require("--data"), spec: spec)
     let labels = try LabelStore.load(try args.require("--labels"), maxRows: spec.dataset.maxExamples)
     let out = try args.require("--out")
     guard out.lastPathComponent.hasSuffix(ClassifierRegistry.suffix) else { throw DistillError.invalidData("--out must end in \(ClassifierRegistry.suffix)") }
 
-    let artifact = try Workflow.train(spec: spec, examples: examples, labels: labels, log: log)
+    let provider = try await representations(args, required: spec.student.features.usesLaya)
+    let artifact = try await Workflow.train(spec: spec, examples: examples, labels: labels, representations: provider, log: log)
     try artifact.save(to: out)
     try writeReport(artifact.evaluation!, args)
     log("[train] wrote \(out.path)")
     try emit(artifact.evaluation!)
 }
 
-func evaluate(_ args: Arguments) throws {
+func evaluate(_ args: Arguments) async throws {
     let artifact = try ClassifierArtifact.load(try args.first())
     let examples = try Dataset.load(try args.require("--data"), spec: artifact.spec)
     let labels = try LabelStore.load(try args.require("--labels"), maxRows: artifact.spec.dataset.maxExamples)
+    let provider = try await representations(args, required: artifact.features.scheme.usesLaya)
 
-    let report = try Workflow.evaluate(Classifier(artifact: artifact), examples: examples, labels: labels)
+    let report = try await Workflow.evaluate(try Classifier(artifact: artifact, representations: provider), examples: examples, labels: labels, log: log)
     try writeReport(report, args)
     try emit(report)
 }
 
-func predict(_ args: Arguments) throws {
+func predict(_ args: Arguments) async throws {
     let artifact = try ClassifierArtifact.load(try args.first())
-    let classifier = Classifier(artifact: artifact)
+    let classifier = try Classifier(artifact: artifact, representations: try await representations(args, required: artifact.features.scheme.usesLaya))
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
 
     if let inline = args.value("--input") {
-        try emit(try classifier.predict(try JSONDecoder().decode(JSONValue.self, from: Data(inline.utf8))))
+        try emit(try await classifier.predict(try JSONDecoder().decode(JSONValue.self, from: Data(inline.utf8))))
         return
     }
 
     while let line = readLine(), !line.isEmpty {
         guard line.utf8.count <= artifact.spec.dataset.maxLineBytes else { throw DistillError.invalidData("stdin line exceeds max_line_bytes") }
-        let prediction = try classifier.predict(try JSONDecoder().decode(JSONValue.self, from: Data(line.utf8)))
+        let prediction = try await classifier.predict(try JSONDecoder().decode(JSONValue.self, from: Data(line.utf8)))
         print(String(decoding: try encoder.encode(prediction), as: UTF8.self))
     }
 }
@@ -175,9 +212,10 @@ do {
     case "init": try initTask(args)
     case "validate": try emit(["name": try TaskSpec.load(try args.first()).name, "status": "valid"])
     case "label": try await label(args)
-    case "train": try train(args)
-    case "eval": try evaluate(args)
-    case "predict": try predict(args)
+    case "import": try importLabels(args)
+    case "train": try await train(args)
+    case "eval": try await evaluate(args)
+    case "predict": try await predict(args)
     case "help", "--help", "-h": print(usage)
     default: throw DistillError.invalidData("unknown command \(args.command)")
     }

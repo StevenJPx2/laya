@@ -6,11 +6,48 @@ public struct SparseVector: Sendable {
     public let values: [Double]
 }
 
+/// How an artifact turns an input into its feature vector. The Laya fields are
+/// set only for Laya feature schemes.
 public struct FeatureDescriptor: Codable, Sendable, Equatable {
-    public static let scheme = "hashed-ngram-v1"
-
-    public let scheme: String
+    public let scheme: FeatureScheme
     public let dimensions: Int
+    /// Training-split mean and standard deviation per logit, in label order.
+    public let mean: [Double]?
+    public let sd: [Double]?
+    public let questionSha256: String?
+    /// Asset fingerprint of the Laya runtime the logits came from.
+    public let layaFingerprint: String?
+
+    enum CodingKeys: String, CodingKey {
+        case scheme, dimensions, mean, sd, questionSha256 = "question_sha256", layaFingerprint = "laya_fingerprint"
+    }
+
+    static func hashed(dimensions: Int) -> FeatureDescriptor {
+        FeatureDescriptor(scheme: .hashedNgram, dimensions: dimensions, mean: nil, sd: nil, questionSha256: nil, layaFingerprint: nil)
+    }
+
+    func validate(spec: TaskSpec) throws {
+        switch scheme {
+        case .hashedNgram:
+            guard mean == nil, sd == nil, questionSha256 == nil, layaFingerprint == nil else {
+                throw DistillError.artifact("hashed-ngram-v1 features carry Laya statistics")
+            }
+
+        case .layaLogits, .layaEmbedding, .layaHybrid:
+            let dense = mean?.count ?? 0
+            let shape = switch scheme {
+            case .layaLogits: dense == spec.labels.count && dimensions == dense
+            case .layaEmbedding: dense > spec.labels.count && dimensions == dense
+            default: dense > spec.labels.count && dimensions > dense
+            }
+            guard let mean, let sd, let questionSha256, let layaFingerprint, !layaFingerprint.isEmpty,
+                  shape, sd.count == mean.count,
+                  mean.allSatisfy(\.isFinite), sd.allSatisfy({ $0.isFinite && $0 >= LayaLogits.sdFloor }) else {
+                throw DistillError.artifact("\(scheme.rawValue) features need finite mean/sd per dimension and a Laya fingerprint")
+            }
+            guard questionSha256 == LayaQuestion.sha256(spec) else { throw DistillError.artifact("\(scheme.rawValue) question hash does not match the spec") }
+        }
+    }
 }
 
 /// Hashed word unigrams and bigrams, globally and per field, with log term
@@ -20,7 +57,7 @@ public struct HashedFeatures: Sendable {
     public let descriptor: FeatureDescriptor
 
     public init(dimensions: Int) {
-        descriptor = FeatureDescriptor(scheme: FeatureDescriptor.scheme, dimensions: dimensions)
+        descriptor = .hashed(dimensions: dimensions)
     }
 
     public func extract(_ input: TaskInput) -> SparseVector {

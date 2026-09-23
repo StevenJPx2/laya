@@ -2,7 +2,7 @@ import Foundation
 import LayaCore
 
 public struct TrainingInfo: Codable, Sendable {
-    /// Laya teacher identities whose labels trained this student.
+    /// Teacher identities whose labels trained this student.
     public let teacher: String
     public let questionSha256: String
     public let examples: Int
@@ -27,12 +27,11 @@ public struct TrainingInfo: Codable, Sendable {
     }
 }
 
-/// A self-contained, versioned student. Validating inputs, extracting
-/// features, and applying the abstain policy need nothing but this file;
-/// Laya is only its training-time teacher.
+/// A versioned student. Hashed-feature students are self-contained; logit
+/// students also need the Laya runtime whose fingerprint they record.
 public struct ClassifierArtifact: Codable, Sendable {
     public static let format = "laya.classifier"
-    public static let formatVersion = 2
+    public static let formatVersion = 3
 
     public var format = Self.format
     public var formatVersion = Self.formatVersion
@@ -102,8 +101,9 @@ public struct ClassifierArtifact: Codable, Sendable {
 
         try spec.validate()
         try model.validate()
+        try features.validate(spec: spec)
 
-        guard features.scheme == FeatureDescriptor.scheme, model.classes == spec.labels.count, model.dimensions == features.dimensions else {
+        guard features.scheme == spec.student.features, model.classes == spec.labels.count, model.dimensions == features.dimensions else {
             throw DistillError.artifact("model shape does not match the task labels or feature scheme")
         }
     }
@@ -130,19 +130,47 @@ public struct Prediction: Codable, Sendable {
     public let abstained: Bool
 }
 
-/// A loaded student. Runs on hashed features only; no Laya model is involved.
+/// A loaded student. Hashed students run on the input alone; logit students
+/// run one Laya forward pass per prediction through `representations`.
 public struct Classifier: Sendable {
     public let artifact: ClassifierArtifact
-    let features: HashedFeatures
+    let encoder: FeatureEncoder
+    let representations: RepresentationProvider?
+    private let question: Question
 
-    public init(artifact: ClassifierArtifact) {
+    /// Rejects a logit student without a runtime, or with a runtime whose
+    /// asset fingerprint differs from the one it was trained on.
+    public init(artifact: ClassifierArtifact, representations: RepresentationProvider? = nil) throws {
+        if artifact.features.scheme.usesLaya {
+            guard let representations else {
+                throw DistillError.artifact("\(artifact.spec.name) uses \(artifact.features.scheme.rawValue) features and needs a Laya runtime")
+            }
+            guard representations.fingerprint == artifact.features.layaFingerprint else {
+                throw DistillError.artifact("\(artifact.spec.name) was trained on Laya assets \(artifact.features.layaFingerprint?.prefix(12) ?? "-") "
+                                            + "but the runtime has \(representations.fingerprint.prefix(12)); retrain against this runtime")
+            }
+        }
+
         self.artifact = artifact
-        features = HashedFeatures(dimensions: artifact.features.dimensions)
+        self.representations = representations
+        encoder = FeatureEncoder(artifact.features)
+        question = LayaQuestion.make(artifact.spec)
     }
 
-    public func predict(_ raw: JSONValue) throws -> Prediction {
+    public func predict(_ raw: JSONValue) async throws -> Prediction {
         let input = try artifact.spec.input.parse(raw)
 
-        return artifact.decide(artifact.model.probabilities(features.extract(input)))
+        return artifact.decide(try probabilities(input, logits: try await logits(input)))
+    }
+
+    /// Laya features (label-ordered logits, then pooled) when this student consumes them.
+    func logits(_ input: TaskInput) async throws -> [Double]? {
+        guard artifact.features.scheme.usesLaya, let representations else { return nil }
+
+        return try await LayaLogits.features(input, spec: artifact.spec, question: question, provider: representations)
+    }
+
+    func probabilities(_ input: TaskInput, logits: [Double]?) throws -> [Double] {
+        artifact.model.probabilities(try encoder.vector(input, laya: logits))
     }
 }

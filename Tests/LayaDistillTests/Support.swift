@@ -23,6 +23,36 @@ final class FakeTeacher: LayaTeacher, @unchecked Sendable {
     }
 }
 
+/// Deterministic stand-in for Laya's frozen representation. Option logits carry
+/// the verb's label (+2) under a strong bias toward `allow` (+3) and small
+/// noise, so Laya zero-shot is mostly `allow` while a standardized linear head
+/// can recover the label.
+final class FakeRepresentations: RepresentationProvider, @unchecked Sendable {
+    let fingerprint: String
+    private let lock = NSLock()
+    private var count = 0
+
+    init(fingerprint: String = "fake-laya-assets") {
+        self.fingerprint = fingerprint
+    }
+
+    var calls: Int { lock.withLock { count } }
+
+    func representation(state: JSONValue, question: Question) async throws -> Representation {
+        lock.withLock { count += 1 }
+
+        let text = Prompt.serialize(state)
+        let label = Fixture.verbs.first { text.contains($0.0) }?.1 ?? "allow"
+        let options = try Prompt.renderedOptions(question)
+        let logits = options.map { option -> Double in
+            let name = String(option.prefix { $0 != ":" })
+            return (name == label ? 2 : 0) + (name == "allow" ? 3 : 0) + 0.8 * Canonical.unitInterval(text + option) - 0.4
+        }
+
+        return Representation(pooled: [Double](repeating: 0, count: 8), logits: logits, options: options)
+    }
+}
+
 enum Fixture {
     static func spec(question: String = "choice", labels: [String] = ["allow", "deny", "ask"], abstain: String? = "ask",
                      minConfidence: Double = 0.6, minMargin: Double = 0.2, uncertain: String = "abstain", extra: String = "") -> String {
@@ -87,6 +117,34 @@ enum Fixture {
 
             return answer(probabilities)
         }
+    }
+
+    /// One jev-distill ledger line with the ledger's bookkeeping fields.
+    static func jevLine(_ id: String, status: String = "labeled", probabilities: [String: Double]?, model: String = "jev-1.13.0",
+                        error: String? = nil) -> String {
+        let choice = probabilities.flatMap { $0.max { $0.value < $1.value }?.key }
+        let object: [String: Any] = [
+            "ledger": "jev-distill.labels", "ledger_version": 1, "id": id, "content_hash": "c-\(id)", "question_hash": "q", "requested_model": model,
+            "attempts": 1, "sdk": "@typesafe-ai/sdk@0.6.0", "labeled_at": "2026-09-01T00:00:00Z", "status": status,
+            "choice": choice ?? NSNull(), "probabilities": probabilities ?? NSNull(), "confidence": probabilities == nil ? NSNull() : 1,
+            "answered_model": probabilities == nil ? NSNull() : model, "usage": ["input_tokens": 490], "charged_input_tokens": 490,
+            "request_id": "req-\(id)", "error": error ?? NSNull(),
+        ]
+
+        return String(decoding: try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self)
+    }
+
+    /// A ledger where Jev labels every row by its verb with full confidence.
+    static func jevLedger(_ examples: [DatasetExample]) -> String {
+        examples.map { example in
+            let text = example.input.rendered
+            let label = verbs.first { text.contains($0.0) }?.1 ?? "allow"
+            return jevLine(example.id, probabilities: ["allow": 0, "deny": 0, "ask": 0].merging([label: 1]) { $1 })
+        }.joined(separator: "\n") + "\n"
+    }
+
+    static func specJSON(_ spec: TaskSpec?) -> String {
+        String(decoding: (try? Canonical.encoder().encode(spec)) ?? Data(), as: UTF8.self)
     }
 
     static func temporaryDirectory() throws -> URL {

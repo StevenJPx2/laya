@@ -43,9 +43,9 @@ public struct Metrics: Codable, Sendable {
     }
 }
 
-/// Student versus Laya on Laya-labeled rows the student did not train on.
+/// Student versus the teacher on teacher-labeled rows the student did not train on.
 public struct AgreementReport: Codable, Sendable {
-    /// Student argmax against the gated Laya training labels.
+    /// Student argmax against the gated teacher training labels.
     public let student: Metrics
     /// Student with its own abstain policy applied (what `predict` serves).
     public let served: Metrics
@@ -59,14 +59,21 @@ public struct AgreementReport: Codable, Sendable {
 public struct GoldReport: Codable, Sendable {
     public let studentServed: Metrics
     public let studentArgmax: Metrics
-    /// Laya's own top label on the gold rows that Laya labeled.
-    public let layaRaw: Metrics?
-    /// Laya after the confidence gate; rows the gate dropped are excluded.
-    public let layaGated: Metrics?
+    /// Identities of the teachers scored in `teacher_raw` / `teacher_gated`.
+    public let teacher: String?
+    /// The teacher's own top label on the gold rows it labeled.
+    public let teacherRaw: Metrics?
+    /// The teacher after the confidence gate; rows the gate dropped are excluded.
+    public let teacherGated: Metrics?
+    /// Argmax of Laya's raw option logits; present when a Laya runtime was available.
+    public let layaZeroShot: Metrics?
     public let majority: Metrics
+    /// Served student accuracy is strictly above Laya zero-shot.
+    public let beatsLayaZeroShot: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case majority, studentServed = "student_served", studentArgmax = "student_argmax", layaRaw = "laya_raw", layaGated = "laya_gated"
+        case teacher, majority, studentServed = "student_served", studentArgmax = "student_argmax", teacherRaw = "teacher_raw"
+        case teacherGated = "teacher_gated", layaZeroShot = "laya_zero_shot", beatsLayaZeroShot = "beats_laya_zero_shot_on_gold"
     }
 }
 
@@ -78,26 +85,31 @@ public struct EvaluationReport: Codable, Sendable {
 
     public var markdown: String {
         var lines = [
-            "Teacher: \(teacher). Split: \(split.train) train / \(split.holdout) Laya holdout / \(split.gold) gold (evaluation-only).",
+            "Teacher: \(teacher). Split: \(split.train) train / \(split.holdout) teacher holdout / \(split.gold) gold (evaluation-only).",
             "",
             "| Reference | Model | n | Accuracy | Macro-F1 |",
             "|---|---|---:|---:|---:|",
         ]
 
         if let agreement {
-            lines.append(row("Laya labels", "Student (argmax)", agreement.student))
-            lines.append(row("Laya labels", "Student (served, abstain rate \(percent(agreement.abstainRate)))", agreement.served))
-            lines.append(row("Laya labels", "Majority class", agreement.majority))
+            lines.append(row("Teacher labels", "Student (argmax)", agreement.student))
+            lines.append(row("Teacher labels", "Student (served, abstain rate \(percent(agreement.abstainRate)))", agreement.served))
+            lines.append(row("Teacher labels", "Majority class", agreement.majority))
         }
         if let gold {
+            let teacher = gold.teacher.map { "Teacher \($0)" } ?? "Teacher"
             lines.append(row("Human gold", "Student (served)", gold.studentServed))
             lines.append(row("Human gold", "Student (argmax)", gold.studentArgmax))
-            if let raw = gold.layaRaw { lines.append(row("Human gold", "Laya teacher (raw argmax)", raw)) }
-            if let gated = gold.layaGated { lines.append(row("Human gold", "Laya teacher (confidence-gated)", gated)) }
+            if let raw = gold.teacherRaw { lines.append(row("Human gold", "\(teacher) (raw argmax)", raw)) }
+            if let gated = gold.teacherGated { lines.append(row("Human gold", "\(teacher) (confidence-gated)", gated)) }
+            if let zeroShot = gold.layaZeroShot { lines.append(row("Human gold", "Laya zero-shot (raw logit argmax)", zeroShot)) }
             lines.append(row("Human gold", "Majority class", gold.majority))
         }
 
         lines.append("")
+        if let beats = gold?.beatsLayaZeroShot {
+            lines.append("Student (served) beats Laya zero-shot on gold: \(beats ? "yes" : "no").")
+        }
         lines.append("Teacher gate on training pool: uncertain→abstain \(split.uncertainToAbstain), uncertain dropped \(split.uncertainDropped), errors \(split.teacherErrors), unlabeled \(split.unlabeled), stale \(split.staleLabels).")
         lines.append("Leakage controls: gold-overlap excluded \(split.goldOverlapExcluded), duplicates removed \(split.duplicatesRemoved), conflicts dropped \(split.conflictsDropped), train-overlap excluded \(split.trainOverlapExcluded).")
 

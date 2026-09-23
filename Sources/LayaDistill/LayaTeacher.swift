@@ -63,7 +63,7 @@ public enum LabelStatus: String, Codable, Sendable {
 
 public struct TeacherDecision: Sendable, Equatable {
     public let status: LabelStatus
-    /// Laya's own top label, before the gate.
+    /// The teacher's own top label, before the gate.
     public let layaLabel: String
     /// The training label, or nil when the row must not be trained on.
     public let label: String?
@@ -71,7 +71,8 @@ public struct TeacherDecision: Sendable, Equatable {
     public let margin: Double
 }
 
-/// The explicit gate that keeps ambiguous Laya output from becoming a hard label.
+/// The explicit gate that keeps ambiguous teacher output (Laya or imported)
+/// from becoming a hard label.
 public enum TeacherPolicy {
     /// Probabilities from the Laya API are rounded to 4 decimals.
     static let tolerance = 1e-9

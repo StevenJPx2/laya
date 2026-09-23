@@ -35,7 +35,8 @@ final class SpecAndDataTests: XCTestCase {
             (Fixture.spec(question: "noul"), "exactly 2 labels"),
             (Fixture.spec(abstain: nil), "requires an abstain label"),
             (Fixture.spec(minConfidence: 1.2), "min_confidence"),
-            (Fixture.spec().replacingOccurrences(of: #""l2": 0.0001"#, with: #""l2": 0.0001, "features": "laya""#), "unknown field(s) features"),
+            (Fixture.spec().replacingOccurrences(of: #""l2": 0.0001"#, with: #""l2": 0.0001, "features": "laya""#), "student.features"),
+            (Fixture.spec().replacingOccurrences(of: #""uncertain": "abstain""#, with: #""uncertain": "abstain", "source": "jev""#), "teacher.source"),
         ]
 
         for (text, message) in rejected {
@@ -45,6 +46,16 @@ final class SpecAndDataTests: XCTestCase {
         }
 
         XCTAssertNoThrow(try Fixture.loadSpec(Fixture.spec(question: "noul", labels: ["safe", "unsafe"], abstain: nil, uncertain: "drop")))
+
+        let plain = try? Fixture.loadSpec(Fixture.spec())
+        let declared = try? Fixture.loadSpec(Fixture.spec().replacingOccurrences(of: #""uncertain": "abstain""#, with: #""uncertain": "abstain", "source": "import""#)
+            .replacingOccurrences(of: #""l2": 0.0001"#, with: #""l2": 0.0001, "features": "laya-logits-v1""#))
+        XCTAssertEqual(plain?.teacher.source, .laya)
+        XCTAssertEqual(plain?.student.features, .hashedNgram)
+        XCTAssertEqual(declared?.teacher.source, .import)
+        XCTAssertEqual(declared?.student.features, .layaLogits)
+        XCTAssertFalse(plain?.sha256.isEmpty ?? true)
+        XCTAssertFalse(Fixture.specJSON(plain).contains("source") || Fixture.specJSON(plain).contains("features"), "undeclared optional fields keep existing spec hashes")
     }
 
     func testInputSchemaValidation() throws {

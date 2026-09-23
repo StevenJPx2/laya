@@ -97,23 +97,26 @@ public enum Dataset {
     }
 }
 
-/// One Laya teacher decision with its provenance. Inputs are never stored,
-/// only the row id, its content hash, and what Laya answered.
+/// One teacher decision (Laya, or an imported teacher such as Jev) with its
+/// provenance. Inputs are never stored, only the row id, its content hash, and
+/// what the teacher answered.
 public struct LabelRecord: Codable, Sendable {
     public let id: String
     public let contentHash: String
-    /// Hash of the exact Laya question; labels for another question are stale.
+    /// Hash of the task's Laya question; labels for another question are stale.
     public let questionSha256: String
     public let teacher: String
     public let status: LabelStatus
-    /// Laya's top label before the confidence gate.
+    /// The teacher's raw top label before the confidence gate. The JSON key
+    /// `laya_label` predates imported teachers and is kept for compatibility.
     public let layaLabel: String?
     /// The label used for training, or nil when the row is excluded.
     public let label: String?
     public let probabilities: [String: Double]?
     public let top: Double?
     public let margin: Double?
-    /// Laya's own entropy-based confidence and action probability, for audit.
+    /// Laya's own entropy-based confidence and action probability, for audit;
+    /// nil for imported teachers.
     public let layaConfidence: Double?
     public let actProbability: Double?
     public let reason: String?
@@ -191,6 +194,18 @@ public enum LabelStore {
 
         try handle.seekToEnd()
         try handle.write(contentsOf: line)
+    }
+
+    /// Replace records by id and rewrite the file atomically, sorted by id.
+    public static func merge(_ records: [LabelRecord], into url: URL, maxRows: Int) throws {
+        var merged = try load(url, maxRows: maxRows)
+        for record in records { merged[record.id] = record }
+
+        let encoder = Canonical.encoder()
+        let data = try merged.keys.sorted().reduce(into: Data()) { data, id in data += try encoder.encode(merged[id]!) + Data([10]) }
+
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
     }
 
     static func fingerprint(_ records: [String: LabelRecord]) -> String {

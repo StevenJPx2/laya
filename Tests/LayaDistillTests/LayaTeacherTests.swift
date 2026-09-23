@@ -28,12 +28,12 @@ final class LayaTeacherTests: XCTestCase {
                       "every uncertain answer failed the gate and trains as the fallback label, not as Laya's argmax")
         XCTAssertTrue(records.filter { $0.status == .accepted }.allSatisfy { $0.label == $0.layaLabel && $0.top! >= 0.6 - 1e-9 })
 
-        try Workflow.train(spec: spec, examples: examples, labels: labels).save(to: artifactURL)
+        try await Workflow.train(spec: spec, examples: examples, labels: labels).save(to: artifactURL)
 
         // Nothing below references Laya: the student artifact is self-contained.
         let artifact = try ClassifierArtifact.load(artifactURL)
-        let classifier = Classifier(artifact: artifact)
-        let prediction = try classifier.predict(.object([("subject", .string("Refund")), ("body", .string("I was charged twice, please refund me."))]))
+        let classifier = try Classifier(artifact: artifact)
+        let prediction = try await classifier.predict(.object([("subject", .string("Refund")), ("body", .string("I was charged twice, please refund me."))]))
         let report = try XCTUnwrap(artifact.evaluation)
         let goldHashes = Set(examples.filter { $0.gold != nil }.map(\.contentHash))
 
@@ -41,8 +41,30 @@ final class LayaTeacherTests: XCTestCase {
         XCTAssertTrue(Set(artifact.training.trainHashes).isDisjoint(with: goldHashes), "gold rows are never trained on")
         XCTAssertEqual(report.split.gold, 48)
         XCTAssertNotNil(report.agreement)
-        XCTAssertEqual(report.gold?.layaRaw?.examples, 48, "Laya itself is scored against every gold row")
+        XCTAssertEqual(report.gold?.teacherRaw?.examples, 48, "Laya itself is scored against every gold row")
         print("real-laya report:\n\(report.markdown)")
+    }
+
+    /// Raw-logit zero-shot must agree with Laya's calibrated `predict` argmax,
+    /// which proves the option-to-label mapping on the real model.
+    func testRealRepresentationLogitsMatchPredict() async throws {
+        guard let model = ProcessInfo.processInfo.environment["LAYA_MODEL"],
+              let assets = ProcessInfo.processInfo.environment["LAYA_ASSETS"] else { throw XCTSkip("set LAYA_MODEL and LAYA_ASSETS") }
+
+        let spec = try TaskSpec.decode(Data(RoutingTemplate.spec.utf8))
+        let runtime = try await LayaRuntime(modelURL: URL(fileURLWithPath: model), assetsURL: URL(fileURLWithPath: assets))
+        let representations = try RuntimeRepresentations(runtime: runtime, assets: URL(fileURLWithPath: assets))
+        let teacher = try await RuntimeTeacher(runtime: runtime, assets: URL(fileURLWithPath: assets))
+        let question = LayaQuestion.make(spec)
+
+        for body in ["I was charged twice, please refund me.", "The app crashes on launch.", "Can I get a quote for 50 seats?", "Hello there."] {
+            let input = try spec.input.parse(.object([("body", .string(body))]))
+            let logits = try await LayaLogits.extract(input, spec: spec, question: question, provider: representations)
+            let answer = try await teacher.answer(state: input.jsonValue, question: question)
+
+            XCTAssertEqual(logits.count, 4)
+            XCTAssertEqual(spec.labelNames[argmax(logits)], answer.choice, body)
+        }
     }
 
     func testDaemonTeacherWhenAvailable() async throws {

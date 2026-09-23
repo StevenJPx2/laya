@@ -109,17 +109,26 @@ public enum QuestionType: String, Codable, Sendable { case choice, noul, score }
 /// - `drop`: exclude the row from training.
 public enum UncertainPolicy: String, Codable, Sendable { case abstain, drop }
 
-/// Laya is the teacher. An answer becomes a hard training label only when its
-/// top probability is at least `min_confidence` and it leads the runner-up by
-/// at least `min_margin`.
+/// Where training labels come from.
+/// - `laya`: `laya-distill label` asks Laya the task question.
+/// - `import`: `laya-distill import` reads labels from an external teacher's ledger.
+public enum TeacherSource: String, Codable, Sendable { case laya, `import` }
+
+/// The labeling teacher (Laya by default, or imported labels). An answer
+/// becomes a hard training label only when its top probability is at least
+/// `min_confidence` and it leads the runner-up by at least `min_margin`.
 public struct TeacherSpec: Codable, Sendable {
     public let questionType: QuestionType
     public let minConfidence: Double
     public let minMargin: Double
     public let uncertain: UncertainPolicy
+    /// Stored only when declared, so specs without it keep their hash.
+    let declaredSource: TeacherSource?
+
+    public var source: TeacherSource { declaredSource ?? .laya }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case questionType = "question_type", minConfidence = "min_confidence", minMargin = "min_margin", uncertain
+        case questionType = "question_type", minConfidence = "min_confidence", minMargin = "min_margin", uncertain, declaredSource = "source"
     }
 
     public init(from decoder: Decoder) throws {
@@ -128,6 +137,7 @@ public struct TeacherSpec: Codable, Sendable {
         minConfidence = try c.decode(Double.self, forKey: .minConfidence)
         minMargin = try c.decodeIfPresent(Double.self, forKey: .minMargin) ?? 0
         uncertain = try c.decode(UncertainPolicy.self, forKey: .uncertain)
+        declaredSource = try c.decodeIfPresent(TeacherSource.self, forKey: .declaredSource)
     }
 
     func validate(labels: Int, hasAbstain: Bool) throws {
@@ -181,8 +191,20 @@ public struct DatasetSpec: Codable, Sendable {
 
 public enum ClassWeighting: String, Codable, Sendable { case balanced, none }
 
-/// The student: a softmax head over hashed word n-grams. It needs no Laya
-/// model at inference time.
+/// Student input features.
+/// - `hashed-ngram-v1`: hashed word n-grams; serving needs no Laya model.
+/// - `laya-logits-v1`: Laya's raw option logits for the task question,
+///   standardized on the training split; serving runs one Laya forward pass.
+/// - `laya-embedding-v1`: those logits plus Laya's pooled decision vector,
+///   standardized the same way; needs more labeled rows than logits alone.
+/// - `laya-hybrid-v1`: the embedding features plus `hash_dimensions` hashed n-grams.
+public enum FeatureScheme: String, Codable, Sendable {
+    case hashedNgram = "hashed-ngram-v1", layaLogits = "laya-logits-v1", layaEmbedding = "laya-embedding-v1", layaHybrid = "laya-hybrid-v1"
+
+    public var usesLaya: Bool { self != .hashedNgram }
+}
+
+/// The student: a softmax head over `features`.
 public struct StudentSpec: Codable, Sendable {
     public let hashDimensions: Int
     public let epochs: Int
@@ -192,9 +214,14 @@ public struct StudentSpec: Codable, Sendable {
     /// cross-validation on the training split only; `l2` is then ignored.
     public let l2Grid: [Double]?
     public let classWeighting: ClassWeighting
+    /// Stored only when declared, so specs without it keep their hash.
+    let declaredFeatures: FeatureScheme?
+
+    public var features: FeatureScheme { declaredFeatures ?? .hashedNgram }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case hashDimensions = "hash_dimensions", epochs, learningRate = "learning_rate", l2, l2Grid = "l2_grid", classWeighting = "class_weighting"
+        case declaredFeatures = "features"
     }
 
     init() {
@@ -204,6 +231,7 @@ public struct StudentSpec: Codable, Sendable {
         l2 = 1e-4
         l2Grid = nil
         classWeighting = .balanced
+        declaredFeatures = nil
     }
 
     public init(from decoder: Decoder) throws {
@@ -215,6 +243,7 @@ public struct StudentSpec: Codable, Sendable {
         l2 = try c.decodeIfPresent(Double.self, forKey: .l2) ?? defaults.l2
         l2Grid = try c.decodeIfPresent([Double].self, forKey: .l2Grid)
         classWeighting = try c.decodeIfPresent(ClassWeighting.self, forKey: .classWeighting) ?? defaults.classWeighting
+        declaredFeatures = try c.decodeIfPresent(FeatureScheme.self, forKey: .declaredFeatures)
     }
 
     func validate() throws {

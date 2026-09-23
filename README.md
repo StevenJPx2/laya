@@ -9,8 +9,9 @@ Silicon. It runs the ModernBERT-large encoder and Laya decision heads through
   newline-delimited JSON over a Unix socket at
   `~/Library/Application Support/laya/laya.sock` (override with `LAYA_SOCKET`).
 - **`laya-distill`** — define a classification task, have Laya label it as the
-  teacher, train a small student that runs without Laya, evaluate it against
-  Laya and human gold labels, and serve it from the same daemon
+  teacher (or import labels from an external teacher), train a small student,
+  evaluate it against the teacher, Laya zero-shot, and human gold labels, and
+  serve it from the same daemon
   ([Task-specific classifiers](#task-specific-classifiers)).
 
 The prompt formatting, marker extraction, softmax/entropy/act features, and
@@ -27,8 +28,8 @@ Swift 6, macOS 15+.
 | `Sources/LayaCore` | Library: tokenizer, prompt build, Core ML runtime, socket server, schema |
 | `Sources/laya-daemon` | Warm daemon over the Unix socket |
 | `Sources/laya` | CLI client: `predict`, `classify`, `health`, `bench` |
-| `Sources/LayaDistill` | Task spec, Laya teacher and confidence gate, split, student training, evaluation, artifacts |
-| `Sources/laya-distill` | CLI: `init`, `validate`, `label`, `train`, `eval`, `predict` |
+| `Sources/LayaDistill` | Task spec, Laya teacher, Jev label import, confidence gate, split, student features and training, evaluation, artifacts |
+| `Sources/laya-distill` | CLI: `init`, `validate`, `label`, `import`, `train`, `eval`, `predict` |
 | `tools/convert` | One-time Core ML export (its own `uv` project) |
 | `tools/generate_golden.py` | Regenerate parity fixtures from the Python reference |
 | `tools/benchmark.sh` | Latency + peak RSS/CPU over N predictions |
@@ -174,20 +175,34 @@ The result schema matches the reference: each answer has `type`, `confidence`,
 
 ## Task-specific classifiers
 
-`laya-distill` uses **Laya as the teacher** for small, task-specific students:
+`laya-distill` trains small, task-specific students from a teacher's labels.
+The teacher is **Laya** by default, or an external teacher whose labels are
+imported (currently a [jev-distill](#importing-jev-labels) ledger):
 
 ```text
-unlabeled rows ──► ask Laya a task question (choice / noul / score) ──► confidence gate ──► labels.jsonl
-                     (installed daemon or local runtime)                 uncertain → abstain label or drop
-labels.jsonl ──► train a hashed n-gram softmax student ──► evaluate vs Laya (holdout) and vs human gold
-                                                        ──► <name>.classifier.json  (runs without Laya)
+unlabeled rows ──► ask Laya a task question (choice / noul / score) ──┐
+                     (installed daemon or local runtime)              ├─► confidence gate ──► labels.jsonl
+jev-distill ledger ──► laya-distill import ───────────────────────────┘   uncertain → abstain label or drop
+labels.jsonl ──► train a softmax student ──► evaluate vs teacher (holdout), Laya zero-shot, and human gold
+                                          ──► <name>.classifier.json
 ```
 
-The student is a softmax-regression head with learned weights over hashed word
-unigrams and bigrams. It is trained natively in Swift with no new
-dependencies. It does **not** use Laya embeddings, and serving it loads no Laya
-model: `laya-distill predict` and the daemon's `classify` op read only the
-artifact. Laya is needed only by `label`.
+The student is a softmax-regression head trained natively in Swift with no new
+dependencies. `student.features` picks its input:
+
+- **`hashed-ngram-v1`** (default): hashed word unigrams and bigrams. Serving
+  loads no Laya model; `predict` and the daemon's `classify` op read only the
+  artifact.
+- **`laya-logits-v1`**: Laya's raw (uncalibrated) option logits for the task
+  question, one per label, standardized with the training split's mean and
+  standard deviation. Training, evaluation, and serving each run one Laya
+  forward pass per row (cached within a run), so they need the Laya runtime.
+- **`laya-embedding-v1`**: those logits plus Laya's 1024-d pooled decision
+  vector, standardized the same way. Same runtime needs; wants hundreds of
+  labeled rows per label, a lower `learning_rate`, and more `epochs`.
+- **`laya-hybrid-v1`**: the embedding features followed by `hash_dimensions`
+  hashed n-grams, in one head. Laya contributes semantics, the n-grams
+  lexical cues.
 
 Nothing here fine-tunes Laya itself; the checkpoint and its heads are unchanged.
 
@@ -205,7 +220,7 @@ $B label tasks/routing/task.json --data tasks/routing/data.jsonl --labels tasks/
 $B label tasks/routing/task.json --data tasks/routing/data.jsonl --labels tasks/routing/labels.jsonl \
     --teacher runtime --model build/laya.mlpackage --assets build/assets
 
-# Everything below runs without Laya.
+# For hashed-ngram students (the default), everything below runs without Laya.
 $B train tasks/routing/task.json --data tasks/routing/data.jsonl --labels tasks/routing/labels.jsonl \
     --out tasks/routing/routing.classifier.json --report tasks/routing/report.md
 $B eval tasks/routing/routing.classifier.json --data tasks/routing/data.jsonl --labels tasks/routing/labels.jsonl
@@ -217,6 +232,57 @@ current record, `--limit N` caps a run, and five consecutive teacher errors stop
 it. It labels gold rows too, so Laya itself can be scored against humans. These
 labels are never trained on.
 
+### Importing Jev labels
+
+```sh
+$B import tasks/routing/task.json --data tasks/routing/data.jsonl     --jev jev-ledger.jsonl --labels tasks/routing/labels.jsonl
+```
+
+`import` reads a `jev-distill.labels` v1 ledger and prints a JSON summary
+(`imported`, `accepted`, `uncertain_*`, `forbidden`, `failed`, `invalid`,
+`unknown_ids`, `missing`). The rules:
+
+- Ledger rows map to dataset rows by `id`; the last line per id wins, and
+  unknown ids are counted and skipped.
+- A labeled row's `probabilities` must cover exactly the task's label names,
+  or the whole import fails.
+- Labeled rows pass the same confidence gate as Laya answers.
+- `forbidden` and `failed` rows become `error` records. They are never trained
+  on, and no label is synthesized for them.
+- Records carry teacher `jev:<answered_model>` and the task's current question
+  hash, so staleness and the split treat them like Laya labels. `import`
+  rewrites the labels file, replacing records by id.
+
+Set `"teacher": {"source": "import", …}` so `label` refuses to overwrite
+imported labels.
+
+### Logit students (`laya-logits-v1`)
+
+```sh
+# in task.json: "student": {"features": "laya-logits-v1", "l2_grid": [...], ...}
+$B train tasks/routing/task.json --data tasks/routing/data.jsonl --labels tasks/routing/labels.jsonl     --out tasks/routing/routing.classifier.json --report tasks/routing/report.md     --model "$HOME/Library/Application Support/laya/laya.mlmodelc" --assets "$HOME/Library/Application Support/laya/assets"
+```
+
+`train`, `eval`, and `predict` load Laya in-process from `--model`/`--assets`.
+Without them they use `$LAYA_MODEL`/`$LAYA_ASSETS`, then
+`~/Library/Application Support/laya/{laya.mlmodelc,assets}`. The artifact
+records the standardization statistics, the question hash, and the Laya asset
+fingerprint. Loading it against a runtime with a different fingerprint fails.
+Passing `--model`/`--assets` to a hashed student's `train` or `eval` adds the
+Laya zero-shot row to its report.
+
+The gold report scores the student (served and argmax), the teacher by
+identity, **Laya zero-shot** (argmax of the raw logits), and the majority
+class. `beats_laya_zero_shot_on_gold` records whether the served student beats
+zero-shot.
+
+A logit head can only reweight what Laya's options already carry, and on a
+10-label task it plateaus early (see [Measured results](#measured-results)).
+Embedding and hybrid heads need hundreds of labels per label to beat it; on
+tiny sets (≈75 rows) they overfit. On permissions, where Laya's options carry
+little signal, no Laya scheme improved. Heads on rounded `predict`
+probabilities did worse than heads on raw logits.
+
 Serve every `*.classifier.json` in a directory from the daemon:
 
 ```sh
@@ -227,7 +293,9 @@ printf '%s\n' '{"op":"classify","classifier":"routing","input":{"body":"The app 
 ```
 
 `{"op":"classifiers"}` lists loaded students. The daemon refuses to start if
-any artifact fails validation. Existing `predict` and `health` requests are
+any artifact fails validation, including a logit student trained on different
+Laya assets. It serves logit students with its own warm runtime: one forward
+pass, then the head and the abstain policy. Existing `predict` and `health` requests are
 unchanged. `LAYA_SOCKET` overrides the socket path for the daemon, `laya`, and
 `laya-distill`.
 
@@ -269,6 +337,10 @@ Strict JSON: every object rejects unknown fields. The routing template:
   - `abstain` trains the row as the abstain label (`other` here, `ask` for a
     permission task), never as Laya's argmax;
   - `drop` excludes the row from training.
+- **`teacher.source`** (optional): `laya` (default) or `import`.
+- **`student.features`** (optional): `hashed-ngram-v1` (default),
+  `laya-logits-v1`, `laya-embedding-v1`, or `laya-hybrid-v1`; see
+  [Logit students](#logit-students-laya-logits-v1).
 - **`abstain`** is also the student's serving policy: below its
   `min_confidence`, the student answers the abstain label.
 - **Input schema**: `string`, `number`, `boolean`, or `json` fields with
@@ -315,20 +387,56 @@ changes the question hash, so earlier labels become stale and are asked again.
 
 ### Artifacts
 
-`<name>.classifier.json` (`format: laya.classifier`, `format_version: 2`)
+`<name>.classifier.json` (`format: laya.classifier`, `format_version: 3`)
 contains:
 
 - the normalized spec and its SHA-256;
-- the feature scheme (`hashed-ngram-v1`), weights, and biases;
+- the feature descriptor, weights, and biases. For Laya schemes the
+  descriptor also holds the per-dimension mean and standard deviation of the
+  Laya values (floor 1e-6), the question hash, and the Laya asset fingerprint;
 - provenance: teacher identity, question hash, dataset and label fingerprints,
   training content hashes, and the chosen L2 with its CV scores;
 - the evaluation report;
 - an integrity hash, verified on load.
 
+Version 2 artifacts are rejected with a message to retrain.
+
 ### Measured results
 
-Both templates were run end to end on this machine with the real Laya runtime
-as teacher, using the commands above. All rows are synthetic, and the sets are
+**Distilling Jev into Laya: CLINC150 domain routing.** The questions and
+human gold labels come from [CLINC150](https://github.com/clinc/oos-eval)
+(crowd-written queries; the official 150-intent → 10-domain map, no
+out-of-scope rows). Pool: 30 train-split queries per intent (4,500), labeled
+by Jev `jev-1.13.0` via jev-distill for $0.113 total with no refusals, then
+`import`ed. Gold: 2 test-split queries per intent (300), evaluation-only. All
+students used the same settings (`learning_rate` 0.01, 1000 epochs, `l2_grid`
+`[0.0001, 0.001, 0.01]`, 4096 hash dimensions) and the same 3,400 / 1,100
+train / teacher-holdout split.
+
+| Model | Gold accuracy (n = 300) | Agreement with Jev (n = 1,100) | CV on train |
+|---|---:|---:|---:|
+| Jev (teacher) | 83.3% | — | — |
+| Student, `laya-hybrid-v1` | **79.7%** (±4.6) | **86.5%** | 87.6% |
+| Student, `hashed-ngram-v1` | 78.3% (±4.7) | 84.8% | 84.6% |
+| Student, `laya-embedding-v1` | 75.3% | 77.5% | 79.4% |
+| Student, `laya-logits-v1` | 66.0% | 67.9% | 71.0% |
+| Laya zero-shot | 54.7% | — | — |
+| Majority class | 10.0% | — | — |
+
+- **Distillation works.** The hybrid student retains about 96% of Jev's gold
+  accuracy and gains 25 points over Laya zero-shot. Served from the daemon it
+  answers in about 80–110 ms, including Laya's forward pass.
+- **Laya's part is small.** Hybrid beats hashed-only by 1.4 points on gold, which is
+  within noise, and by 1.7 points of agreement with Jev. The gain is
+  consistent across CV, teacher holdout, and gold, but a hashed student is
+  nearly as accurate and needs no model at serving time.
+- **Labels matter most.** Going from 798 to 3,400 Jev labels moved hashed from
+  73.0% to 78.3% and hybrid from 74.3% to 79.7%. Logit heads stayed at about 65%.
+- Training embedding or hybrid heads on 3,400 rows took about 40 minutes
+  (full-batch, in-process Laya features); hashed took about 1 minute.
+
+The templates below were run end to end on this machine with the real Laya
+runtime as teacher, using the commands above. All rows are synthetic, and the sets are
 tiny: one row is about 2 points on gold (n = 48) and 5.6 points on the routing
 holdout (n = 18).
 
@@ -369,22 +477,25 @@ majority baseline on both references by more than noise.
 
 ### Limitations
 
-- The student is a linear model over hashed n-grams; it is only as good as the
-  volume and quality of Laya's confident labels.
+- The student is a linear model over hashed n-grams and/or frozen Laya
+  features; it is only as good as the volume and quality of the teacher's
+  confident labels.
+- Laya features are recomputed on every `train`/`eval` run (about 0.1 s per
+  row); they are not persisted between runs.
 - Training uses hard labels only; Laya's probabilities are recorded but not used
   as soft targets.
 - Laya reads at most 512 tokens per question. Longer inputs are truncated by
   Laya's own prompt builder when labeling.
-- Training is full-batch and in memory, and has been run only at these template
-  and test sizes (≤ 120 rows).
+- Training is full-batch and in memory. It has been run up to 4,800 rows,
+  where dense Laya schemes are slow (see above).
 - The runtime teacher's asset fingerprint is a cheap compatibility check
   (runtime manifest, action-head weights, first 4 MiB of embeddings), not a hash
   of every weight. The daemon teacher reports only the model name.
 
 ### Tests
 
-`swift test` runs 15 offline tests with a deterministic fake Laya teacher and
-no model:
+`swift test` runs 23 offline tests with a deterministic fake Laya teacher, a
+fake Laya representation provider, and no model:
 
 - strict spec parsing and input validation;
 - bounded loading;
@@ -393,14 +504,24 @@ no model:
 - `choice`, `noul`, and `score` question mapping;
 - labeler resume, staleness, limits, and the error stop;
 - an end-to-end student (label, train, save, reload, predict without Laya,
-  re-evaluate), daemon `classify`, tamper rejection, and CV selection.
+  re-evaluate), daemon `classify`, tamper rejection, and CV selection;
+- Jev import (gate, last line wins, forbidden and failed rows, unknown ids,
+  mismatched labels);
+- a logit student end to end (import, train with one forward pass per row,
+  beat zero-shot, reload), the v3 fingerprint check, and daemon `classify`
+  for a logit student;
+- embedding and hybrid students end to end (standardized logits plus pooled
+  values, hashed n-grams appended for hybrid, zero-shot from logits only,
+  serving, and the runtime requirement).
 
-Two tests need real Laya:
+Three tests need real Laya:
 
 - `LayaTeacherTests/testRealRuntimeLabelsAndStudentRunsWithoutLaya` runs with
   `LAYA_MODEL` and `LAYA_ASSETS`. The real runtime labels the routing template,
   then the test trains, saves, reloads, and predicts with no Laya object in
   scope.
+- `testRealRepresentationLogitsMatchPredict` (same variables) checks that the
+  raw-logit argmax, mapped to labels, agrees with Laya's `predict` choice.
 - `testDaemonTeacherWhenAvailable` runs with `LAYA_TEST_SOCKET` pointing at a
   running daemon.
 
