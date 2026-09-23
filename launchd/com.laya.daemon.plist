@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Reference template. tools/install-daemon.sh writes the user-specific
+     launch agent and selects the precompiled model when available. -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.laya.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/laya-daemon</string>
+    <string>/Users/USERNAME/Library/Application Support/laya/laya.mlpackage</string>
+    <string>/Users/USERNAME/Library/Application Support/laya/assets</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <!-- Background priority keeps the warm daemon out of the way of foreground work. -->
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+</dict></plist>

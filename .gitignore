@@ -1,0 +1,35 @@
+# Swift
+.build/
+.swiftpm/
+*.xcodeproj
+DerivedData/
+
+# Build outputs and model artifacts (large; regenerate with tools/convert)
+build/
+*.mlpackage
+*.mlmodelc
+*.safetensors
+*.f16.bin
+*.f32.bin
+
+# Python (conversion tooling)
+tools/convert/.venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# Editor and operating-system state
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log
