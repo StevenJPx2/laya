@@ -4,12 +4,18 @@ import Darwin
 /// Newline-delimited JSON over a Unix socket. One request per line; the daemon
 /// keeps the model warm and serves connections as they arrive.
 public final class UnixSocketServer: @unchecked Sendable {
+    /// Serves additional `op` values (for example `classify`). Receives the op
+    /// name and the raw request line; returns one encoded JSON response.
+    public typealias OperationHandler = @Sendable (String, Data) async throws -> Data
+
     private let path: String
     private let runtime: LayaRuntime
+    private let operations: OperationHandler?
 
-    public init(path: String, runtime: LayaRuntime) {
+    public init(path: String, runtime: LayaRuntime, operations: OperationHandler? = nil) {
         self.path = path
         self.runtime = runtime
+        self.operations = operations
     }
 
     public func run() async throws {
@@ -69,6 +75,16 @@ public final class UnixSocketServer: @unchecked Sendable {
             if request.op == "health" {
                 let health = await runtime.health()
                 try writeJSON(health, to: client)
+                return
+            }
+
+            if let op = request.op {
+                guard let operations else {
+                    try writeError("unknown op \(op)", to: client)
+                    return
+                }
+
+                try write(try await operations(op, line) + Data([10]), to: client)
                 return
             }
 
