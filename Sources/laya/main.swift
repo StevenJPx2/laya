@@ -1,11 +1,8 @@
 import Foundation
-import Darwin
 import LayaCore
 
-/// Small client for the laya daemon: predict, health, and bench over the socket.
+/// Small client for the laya daemon: predict, classify, health, and bench over the socket.
 @main struct LayaCLI {
-    static let socketPath = ProcessInfo.processInfo.environment["LAYA_SOCKET"] ?? NSString("~/Library/Application Support/laya/laya.sock").expandingTildeInPath
-
     static func main() async throws {
         let arguments = CommandLine.arguments
 
@@ -39,38 +36,7 @@ import LayaCore
 
     /// Send one newline-terminated JSON request and return the daemon's reply line.
     private static func request(_ payload: Data) throws -> String {
-        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw LayaError.protocolError("socket failed") }
-        defer { close(fd) }
-
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        _ = socketPath.withCString { ptr in
-            withUnsafeMutableBytes(of: &address.sun_path) { bytes in
-                memcpy(bytes.baseAddress, ptr, min(socketPath.utf8.count, bytes.count - 1))
-            }
-        }
-
-        let connected = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
-        }
-        guard connected == 0 else { throw LayaError.protocolError("connect failed; is laya-daemon running?") }
-
-        let line = payload.last == 10 ? payload : payload + Data([10])
-        line.withUnsafeBytes { _ = Darwin.write(fd, $0.baseAddress, line.count) }
-
-        var response = Data()
-        var buffer = [UInt8](repeating: 0, count: 16384)
-
-        while true {
-            let count = read(fd, &buffer, buffer.count)
-            if count <= 0 { break }
-
-            response.append(contentsOf: buffer[0..<count])
-            if response.contains(10) { break }
-        }
-
-        return String(decoding: response, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        String(decoding: try SocketClient.request(payload), as: UTF8.self)
     }
 
     /// Time `iterations` predictions and report P50/P95 latency at the socket boundary.
