@@ -4,7 +4,7 @@ import LayaCore
 
 /// Small client for the laya daemon: predict, health, and bench over the socket.
 @main struct LayaCLI {
-    static let socketPath = NSString("~/Library/Application Support/laya/laya.sock").expandingTildeInPath
+    static let socketPath = ProcessInfo.processInfo.environment["LAYA_SOCKET"] ?? NSString("~/Library/Application Support/laya/laya.sock").expandingTildeInPath
 
     static func main() async throws {
         let arguments = CommandLine.arguments
@@ -17,6 +17,12 @@ import LayaCore
             guard let path = arguments.dropFirst(2).first else { return usage() }
             print(try request(Data(contentsOf: URL(fileURLWithPath: path))))
 
+        case "classify":
+            guard let name = arguments.dropFirst(2).first, let path = arguments.dropFirst(3).first else { return usage() }
+            let input = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+            let payload: [String: JSONValue] = ["op": .string("classify"), "classifier": .string(name), "input": input]
+            print(try request(JSONEncoder().encode(payload)))
+
         case "bench":
             guard let path = arguments.dropFirst(2).first else { return usage() }
             let iterations = arguments.dropFirst(3).first.flatMap(Int.init) ?? 1000
@@ -28,7 +34,7 @@ import LayaCore
     }
 
     private static func usage() {
-        fputs("usage: laya health | laya predict <request.json> | laya bench <request.json> [iterations]\n", stderr)
+        fputs("usage: laya health | laya predict <request.json> | laya classify <classifier> <input.json> | laya bench <request.json> [iterations]\n", stderr)
     }
 
     /// Send one newline-terminated JSON request and return the daemon's reply line.
